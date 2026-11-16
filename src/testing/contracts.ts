@@ -1,0 +1,269 @@
+import { describe, it } from 'node:test';
+import assert from 'node:assert/strict';
+import { randomUUID, createHash } from 'node:crypto';
+import { createApplication } from '../application.js';
+import {
+  DomainError,
+  type StorageAdapter,
+  type SearchAdapter,
+  type EmbeddingProvider,
+  type Actor,
+  type Project,
+  type Ticket,
+  type Policy,
+} from '../contracts.js';
+
+export const testEmbeddings: EmbeddingProvider = {
+  profile: {
+    id: createHash('sha256').update('contract-test-only').digest('hex').slice(0, 24),
+    model: 'test-only',
+    dimensions: 3,
+  },
+  async embed(text) {
+    return [1, text.includes('database') ? 1 : 0.2, text.includes('security') ? 1 : 0.2];
+  },
+};
+export interface ContractAdapters {
+  storage: StorageAdapter;
+  search: SearchAdapter;
+  dispose?: () => Promise<void>;
+}
+export async function fixture(adapters: ContractAdapters, policy: Policy = 'independent') {
+  const { storage, search } = adapters;
+  const clock = { now: new Date() };
+  const app = createApplication({ storage, search, embeddings: testEmbeddings, now: () => clock.now });
+  const actor = (name: string, kind: Actor['kind'] = 'agent', system_admin = false): Actor => ({
+    id: randomUUID(),
+    issuer: 'contract-test',
+    subject: randomUUID(),
+    name,
+    kind,
+    system_admin,
+  });
+  const admin = actor('administrator', 'human', true),
+    worker = actor('worker'),
+    other = actor('other worker'),
+    reviewer = actor('reviewer', 'human'),
+    outsider = actor('outsider');
+  await storage.transaction('catalog', async (tx) => {
+    for (const person of [admin, worker, other, reviewer, outsider]) await tx.put('actors', person);
+  });
+  const project = (await app.execute(admin.id, 'project_create', {
+    key: 'T' + randomUUID().replaceAll('-', '').slice(0, 8).toUpperCase(),
+    name: 'Contract test',
+    policy,
+    idempotency_key: randomUUID(),
+  })) as Project;
+  for (const [person, role] of [
+    [worker, 'contributor'],
+    [other, 'contributor'],
+    [reviewer, 'verifier'],
+  ] as const)
+    await app.execute(admin.id, 'member_set', {
+      project_id: project.id,
+      actor_id: person.id,
+      role,
+      idempotency_key: randomUUID(),
+    });
+  const call = async (actorId: string, operation: any, input: Record<string, unknown> = {}) =>
+    app.execute(actorId, operation, { project_id: project.id, idempotency_key: randomUUID(), ...input });
+  const ticket = async (overrides: Record<string, unknown> = {}) =>
+    (
+      (await call(worker.id, 'tickets_create', {
+        tickets: [
+          {
+            title: 'Improve database security',
+            description: 'Make the database secure.',
+            criteria: ['The access check works.'],
+            status: 'ready',
+            ...overrides,
+          },
+        ],
+      })) as { tickets: Ticket[] }
+    ).tickets[0]!;
+  const read = async (id: string) =>
+    app.execute(worker.id, 'ticket_get', { project_id: project.id, ticket_id: id }) as Promise<any>;
+  const claim = async (id?: string, actorId = worker.id) =>
+    call(actorId, 'work_claim', id ? { ticket_id: id } : {}) as Promise<any>;
+  const submit = async (id: string, claimToken: string, actorId = worker.id) => {
+    const current = await read(id);
+    return call(actorId, 'ticket_submit', {
+      ticket_id: id,
+      claim_token: claimToken,
+      expected_revision: current.ticket.revision,
+      summary: 'Verified the implementation.',
+      evidence: current.criteria.map((criterion: any) => ({
+        criterion_id: criterion.id,
+        result: 'pass',
+        summary: 'Assertion passed.',
+        references: ['https://example.test/evidence'],
+      })),
+    }) as Promise<any>;
+  };
+  return {
+    app,
+    storage,
+    search,
+    clock,
+    admin,
+    worker,
+    other,
+    reviewer,
+    outsider,
+    project,
+    call,
+    ticket,
+    read,
+    claim,
+    submit,
+  };
+}
+export function hasCode(code: string) {
+  return (error: unknown) => error instanceof DomainError && error.code === code;
+}
+/** Import this suite from another adapter package; no PostgreSQL types are exposed. */
+export function registerAdapterContractTests(name: string, factory: () => Promise<ContractAdapters>) {
+  describe(`${name} adapter contract`, () => {
+    const check = (title: string, work: (f: Awaited<ReturnType<typeof fixture>>) => Promise<void>) =>
+      it(title, async () => {
+        const adapters = await factory();
+        try {
+          await adapters.storage.migrate();
+          await adapters.search.configure(testEmbeddings.profile);
+          await work(await fixture(adapters));
+        } finally {
+          await adapters.dispose?.();
+        }
+      });
+    check('rolls back all records when an atomic operation fails', async (f) => {
+      const id = randomUUID();
+      await assert.rejects(
+        f.storage.transaction(f.project.id, async (tx) => {
+          await tx.put('actors', { ...f.worker, id, subject: id });
+          throw new Error('rollback');
+        }),
+      );
+      assert.equal(await f.storage.get('actors', id), null);
+    });
+    check('grants exactly one concurrent claim', async (f) => {
+      const ticket = await f.ticket();
+      const attempts = await Promise.allSettled(
+        Array.from({ length: 16 }, (_, i) => f.claim(ticket.id, i % 2 ? f.worker.id : f.other.id)),
+      );
+      assert.equal(attempts.filter((item) => item.status === 'fulfilled').length, 1);
+      const winner = attempts.find((item) => item.status === 'fulfilled') as PromiseFulfilledResult<any>;
+      const observer = winner.value.claim.actor_id === f.worker.id ? f.other : f.worker;
+      const context = (await f.app.execute(observer.id, 'ticket_context', {
+        project_id: f.project.id,
+        ticket_id: ticket.id,
+        detail: 'brief',
+      })) as any;
+      assert.ok(!context.next_actions.includes('work_claim'));
+    });
+    check('atomically distributes next work to concurrent agents', async (f) => {
+      for (let i = 0; i < 16; i++) await f.ticket();
+      const claims = await Promise.all(Array.from({ length: 16 }, () => f.claim()));
+      assert.equal(new Set(claims.map((result) => result.ticket.id)).size, 16);
+    });
+    check('deduplicates retries and rejects changed inputs', async (f) => {
+      const input = {
+        tickets: [{ title: 'One ticket', description: 'One description', criteria: ['One criterion'] }],
+        idempotency_key: randomUUID(),
+      };
+      const [a, b] = await Promise.all([
+        f.call(f.worker.id, 'tickets_create', input),
+        f.call(f.worker.id, 'tickets_create', input),
+      ]);
+      assert.deepEqual(a, b);
+      await assert.rejects(
+        f.call(f.worker.id, 'tickets_create', {
+          ...input,
+          tickets: [{ ...input.tickets[0], title: 'Different' }],
+        }),
+        hasCode('IDEMPOTENCY_CONFLICT'),
+      );
+    });
+    check('rejects stale revisions and superseded lease tokens', async (f) => {
+      const ticket = await f.ticket();
+      const first = await f.claim(ticket.id);
+      await assert.rejects(
+        f.call(f.worker.id, 'ticket_update', {
+          ticket_id: ticket.id,
+          expected_revision: ticket.revision,
+          title: 'Changed',
+        }),
+        hasCode('VERSION_CONFLICT'),
+      );
+      f.clock.now = new Date(f.clock.now.getTime() + 601000);
+      const second = await f.claim(ticket.id, f.other.id);
+      assert.notEqual(first.claim.token, second.claim.token);
+      await assert.rejects(
+        f.call(f.worker.id, 'ticket_checkpoint', {
+          ticket_id: ticket.id,
+          claim_token: first.claim.token,
+          progress: 'stale',
+        }),
+        hasCode('CLAIM_EXPIRED'),
+      );
+    });
+    check('orders durable events without gaps under concurrent writes', async (f) => {
+      const ticket = await f.ticket();
+      const initial = (await f.app.execute(f.worker.id, 'changes_since', {
+        project_id: f.project.id,
+      })) as any;
+      await Promise.all(
+        Array.from({ length: 12 }, (_, i) =>
+          f.call(f.worker.id, 'ticket_note', { ticket_id: ticket.id, body: `note ${i}` }),
+        ),
+      );
+      const result = (await f.app.execute(f.worker.id, 'changes_since', {
+        project_id: f.project.id,
+        cursor: initial.next_cursor,
+      })) as any;
+      assert.deepEqual(
+        result.events.map((e: any) => e.seq),
+        Array.from({ length: 12 }, (_, i) => initial.next_cursor + i + 1),
+      );
+    });
+    check('indexes text independently and rejects stale index writes', async (f) => {
+      const ticket = await f.ticket();
+      const source = (await f.app.sourceDocument(f.storage, 'ticket', ticket.id))!;
+      await f.search.indexText(source);
+      await f.search.indexVector(source, testEmbeddings.profile, [1, 1, 0.2]);
+      assert.ok((await f.search.search(f.project.id, 'database', 10)).some((hit) => hit.id === ticket.id));
+      await f.search.indexText({ ...source, revision: source.revision + 1, archived: true });
+      await f.search.indexText(source);
+      assert.equal((await f.search.search(f.project.id, 'database', 10)).length, 0);
+    });
+    check('reports index coverage and invalidates snapshots after indexing', async (f) => {
+      const ticket = await f.ticket();
+      const source = (await f.app.sourceDocument(f.storage, 'ticket', ticket.id))!;
+      assert.equal((await f.search.coverage(f.project.id, testEmbeddings.profile)).documents, 0);
+      await f.search.indexText(source);
+      assert.equal((await f.search.coverage(f.project.id, testEmbeddings.profile)).documents, 1);
+      await f.search.indexVector(source, testEmbeddings.profile, [1, 1, 0.2]);
+      const complete = await f.search.coverage(f.project.id, testEmbeddings.profile);
+      assert.equal(complete.embedded, 1);
+      assert.ok(Date.parse(complete.observed_at));
+      await f.search.indexText({ ...source, revision: source.revision + 1, archived: true });
+      assert.equal((await f.search.coverage(f.project.id, testEmbeddings.profile)).documents, 0);
+    });
+    check('leases each indexing job once and fences stale job completions', async (f) => {
+      const ticket = await f.ticket();
+      const jobs = await f.storage.leaseJobs(1000, 60000);
+      const job = jobs.find((item) => item.entity_id === ticket.id);
+      assert.ok(job);
+      assert.equal(
+        (await f.storage.leaseJobs(1000, 60000)).some((item) => item.id === job.id),
+        false,
+      );
+      await f.call(f.worker.id, 'ticket_update', {
+        ticket_id: ticket.id,
+        expected_revision: ticket.revision,
+        title: 'New title',
+      });
+      await f.storage.finishJob(job);
+      assert.ok(await f.storage.get('jobs', job.id));
+    });
+  });
+}

@@ -1,0 +1,65 @@
+{
+  "name": "ai-ticketing-mcp",
+  "version": "1.0.0",
+  "description": "Headless AI work coordination through MCP, with replaceable storage and semantic search.",
+  "type": "module",
+  "license": "Apache-2.0",
+  "engines": {
+    "node": ">=24"
+  },
+  "bin": {
+    "ai-ticketing": "dist/cli.js"
+  },
+  "exports": {
+    ".": "./dist/index.js",
+    "./contracts": "./dist/contracts.js",
+    "./testing": "./dist/testing/contracts.js",
+    "./postgres": "./dist/adapters/postgres.js"
+  },
+  "files": [
+    "dist",
+    "migrations",
+    "README.md",
+    "LICENSE",
+    "NOTICE"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "check": "tsc --noEmit",
+    "start": "node dist/cli.js serve",
+    "dev": "tsx src/cli.ts",
+    "test": "tsx --test --test-concurrency=1 tests/*.test.ts",
+    "test:integration": "tsx --test --test-concurrency=1 tests/integration/*.test.ts",
+    "test:all": "npm run check && npm test && npm run test:integration",
+    "commit:check": "node scripts/check-commits.mjs",
+    "benchmark": "tsx scripts/benchmark.ts",
+    "walkthrough": "tsx scripts/walkthrough.ts",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "secrets:check": "node scripts/check-secrets.mjs"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.6",
+    "@types/pg": "^8.23.1",
+    "prettier": "^3.10.1",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/client": "^2.4.0",
+    "@modelcontextprotocol/node": "^2.1.2",
+    "@modelcontextprotocol/server": "^2.4.0",
+    "jose": "^6.2.17",
+    "pg": "^8.23.1",
+    "zod": "^4.6.7"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/xRedLeader/ai-ticketing-mcp.git"
+  },
+  "homepage": "https://github.com/xRedLeader/ai-ticketing-mcp#readme",
+  "bugs": {
+    "url": "https://github.com/xRedLeader/ai-ticketing-mcp/issues"
+  },
+  "author": "Brenden Smith"
+}
