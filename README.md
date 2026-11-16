@@ -1,0 +1,89 @@
+# AI Ticketing MCP
+
+Headless ticketing built for agents: find useful work, claim it safely, recover context, and finish with evidence. Control it through the Model Context Protocol (MCP).
+
+**One team, multiple projects, many agents.** PostgreSQL is the default implementation; storage, search, and embedding providers are replaceable through exported TypeScript contracts.
+
+## What agents get
+
+- Structured tickets with acceptance criteria, priorities, capabilities, parents, and blocking dependencies.
+- Atomic ten-minute claims, heartbeat renewal, stale-worker fencing, and retry-safe mutations.
+- Durable checkpoints, blocking questions, decisions, and artifact references.
+- One-call context with complete requirements, project instructions, prior work, and relevant knowledge.
+- Self, independent-agent, or human verification policies. Independent review is the default.
+- Hybrid text/vector search, using local Ollama or a hosted OpenAI-compatible embedding provider.
+- Attributable events and durable polling cursors, without keeping an MCP connection alive.
+- Local stdio and OAuth-protected Streamable HTTP; no frontend or agent runtime required.
+
+## Quickstart
+
+Install Docker with Compose and Node.js 24 or newer. From a clean checkout:
+
+```sh
+npm ci
+node scripts/setup.mjs
+docker compose --profile auth --profile local-ai up -d --build
+```
+
+Setup creates private random passwords in the ignored `.env` file and preserves existing configuration. The first start downloads the embedding model. Check readiness with `docker compose ps` and `docker compose logs model-pull`.
+
+- MCP: `http://localhost:3000/mcp`
+- OAuth metadata: `http://localhost:3000/.well-known/oauth-protected-resource/mcp`
+- Keycloak: `http://localhost:8080` (administrator `admin`, password from your private `.env`)
+- PostgreSQL: localhost port 5432; roles `ticketing_owner` for migrations and `ticketing_app` for runtime.
+
+Run the two-agent walkthrough from the host:
+
+```sh
+npm run walkthrough
+```
+
+It creates an isolated demo project, connects separate MCP clients, claims work, records a checkpoint, submits evidence, and obtains independent approval. It uses local trusted operator access to register the demo identities. Its final output includes the project and ticket identifiers.
+
+For real users and agents, follow [identity and client setup](docs/authentication.md). The realm contains no preconfigured ordinary users and the application grants no permissions automatically.
+
+## The work loop
+
+1. `project_list` and `project_get` discover accessible projects and instructions.
+2. `work_next` finds eligible work; `work_claim` acquires it atomically.
+3. `ticket_context` returns requirements, blockers, the checkpoint, and relevant sources.
+4. `ticket_checkpoint` preserves progress; `work_heartbeat` renews ownership at least every three minutes.
+5. `ticket_submit` supplies passing evidence for every criterion.
+6. `ticket_review` approves or requests changes according to project policy.
+
+Use a fresh `idempotency_key` for each logical mutation, reusing it only for an identical retry. Read the latest revision before edits and submission. A changed requirement revokes claims and invalidates affected approvals; an old worker cannot continue with its former token.
+
+Ticket references accept a UUID or readable key such as `CORE-42`. Project references use UUIDs. Full [tool and workflow behavior](docs/mcp.md) is documented separately.
+
+## Extending the system
+
+```ts
+import { createApplication } from 'ai-ticketing-mcp';
+import type { StorageAdapter, SearchAdapter, EmbeddingProvider } from 'ai-ticketing-mcp/contracts';
+
+const app = createApplication({ storage, search, embeddings });
+```
+
+Supply your own adapters and retain the application operations and MCP tools. `ai-ticketing-mcp/postgres` exports the default adapters; `ai-ticketing-mcp/testing` exports reusable contract tests. See [adapter development](docs/adapters.md) for transaction guarantees, migration ownership, and an implementation example.
+
+The package can be consumed from this repository after building; an npm registry release is not required. No alternate production database adapter is advertised until it passes the same tests.
+
+## Development and verification
+
+```sh
+npm ci
+npm run build
+npm test
+# Set TEST_DATABASE_URL to a disposable PostgreSQL database with pgvector.
+npm run test:integration
+npm run check
+npm run format:check
+```
+
+Integration tests require a real database and fail clearly when it is not configured. They exercise claims, races, retries, stale workers, review policies, permissions, search freshness, and both MCP transports. See the [verification record](docs/verification.md) for measured results and [operations](docs/operations.md) for backup/restore, rebuilding search, and benchmarks.
+
+Contributions use [Conventional Commits](CONTRIBUTING.md). Public MCP and adapter contracts follow semantic versioning. Licensed under [Apache-2.0](LICENSE).
+
+## Boundaries
+
+The server coordinates work; it does not execute agent commands or independently prove evidence. Binary artifacts stay in external systems. Hosted embedding providers receive indexed text. Retrieval is eventually consistent and reports degraded semantic coverage; authoritative ticket reads remain available while indexing catches up.
