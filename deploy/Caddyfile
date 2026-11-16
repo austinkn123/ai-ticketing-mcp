@@ -1,0 +1,6 @@
+{$TICKETING_DOMAIN} {
+  reverse_proxy app:3000
+}
+{$LOGIN_DOMAIN} {
+  reverse_proxy keycloak:8080
+}

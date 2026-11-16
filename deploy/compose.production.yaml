@@ -1,0 +1,18 @@
+services:
+  keycloak:
+    command: ['start', '--import-realm', '--http-enabled=true', '--proxy-headers=xforwarded']
+  proxy:
+    image: caddy:2
+    restart: unless-stopped
+    environment:
+      TICKETING_DOMAIN: ${TICKETING_DOMAIN:?Set TICKETING_DOMAIN}
+      LOGIN_DOMAIN: ${LOGIN_DOMAIN:?Set LOGIN_DOMAIN}
+    ports: ['80:80', '443:443']
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - certificates:/data
+      - proxy_config:/config
+    depends_on: [app, keycloak]
+volumes:
+  certificates:
+  proxy_config:
