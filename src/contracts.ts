@@ -181,6 +181,13 @@ export interface Query<T> {
   offset?: number;
 }
 export interface Reader {
+  unansweredQuestions(
+    projectId: string,
+    ticketId: string,
+    blocking: boolean,
+    limit: number,
+    offset: number,
+  ): Promise<Note[]>;
   /** Ordered candidates; shared domain logic rechecks eligibility inside the transaction. */
   workCandidates(
     projectId: string,
@@ -199,6 +206,8 @@ export interface Transaction extends Reader {
   remove<K extends Table>(table: K, id: string): Promise<void>;
 }
 export interface StorageAdapter extends Reader {
+  /** One consistent read-only view, independent of project mutation locks. */
+  readSnapshot<T>(work: (reader: Reader) => Promise<T>): Promise<T>;
   /** Serializes mutations in a scope, commits atomically, and rolls back on failure. */
   transaction<T>(scope: string, work: (tx: Transaction) => Promise<T>): Promise<T>;
   /** Atomically leases durable jobs, including abandoned jobs whose lease expired. */
@@ -239,7 +248,13 @@ export interface EmbeddingProfile {
 export interface SearchAdapter {
   configure(profile: EmbeddingProfile): Promise<void>;
   indexText(document: SearchDocument): Promise<void>;
-  indexVector(document: SearchDocument, profile: EmbeddingProfile, vector: number[]): Promise<void>;
+  indexVector(
+    document: SearchDocument,
+    profile: EmbeddingProfile,
+    vector: number[],
+    inputHash?: string,
+  ): Promise<void>;
+  reuseVector?(document: SearchDocument, profile: EmbeddingProfile, inputHash: string): Promise<boolean>;
   search(
     projectId: string,
     query: string,

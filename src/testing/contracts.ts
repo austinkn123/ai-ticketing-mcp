@@ -48,12 +48,13 @@ export async function fixture(adapters: ContractAdapters, policy: Policy = 'inde
   await storage.transaction('catalog', async (tx) => {
     for (const person of [admin, worker, other, reviewer, outsider]) await tx.put('actors', person);
   });
-  const project = (await app.execute(admin.id, 'project_create', {
+  const createdProject = (await app.execute(admin.id, 'project_create', {
     key: 'T' + randomUUID().replaceAll('-', '').slice(0, 8).toUpperCase(),
     name: 'Contract test',
     policy,
     idempotency_key: randomUUID(),
   })) as Project;
+  const project = (await storage.get('projects', createdProject.id))!;
   for (const [person, role] of [
     [worker, 'contributor'],
     [other, 'contributor'],
@@ -67,8 +68,8 @@ export async function fixture(adapters: ContractAdapters, policy: Policy = 'inde
     });
   const call = async (actorId: string, operation: any, input: Record<string, unknown> = {}) =>
     app.execute(actorId, operation, { project_id: project.id, idempotency_key: randomUUID(), ...input });
-  const ticket = async (overrides: Record<string, unknown> = {}) =>
-    (
+  const ticket = async (overrides: Record<string, unknown> = {}) => {
+    const created = (
       (await call(worker.id, 'tickets_create', {
         tickets: [
           {
@@ -81,6 +82,8 @@ export async function fixture(adapters: ContractAdapters, policy: Policy = 'inde
         ],
       })) as { tickets: Ticket[] }
     ).tickets[0]!;
+    return (await storage.get('tickets', created.id))!;
+  };
   const read = async (id: string) =>
     app.execute(worker.id, 'ticket_get', { project_id: project.id, ticket_id: id }) as Promise<any>;
   const claim = async (id?: string, actorId = worker.id) =>
@@ -145,6 +148,65 @@ export function registerAdapterContractTests(name: string, factory: () => Promis
       );
       assert.equal(await f.storage.get('actors', id), null);
     });
+    check('keeps one read-only snapshot coherent without blocking mutations or other readers', async (f) => {
+      const ticket = await f.ticket();
+      let entered!: () => void;
+      let advance!: () => void;
+      const ready = new Promise<void>((resolve) => {
+        entered = resolve;
+      });
+      const resume = new Promise<void>((resolve) => {
+        advance = resolve;
+      });
+      const reading = f.storage.readSnapshot(async (reader) => {
+        assert.equal('put' in reader, false);
+        assert.equal('remove' in reader, false);
+        const before = await reader.get('tickets', ticket.id);
+        entered();
+        await resume;
+        return [before, await reader.get('tickets', ticket.id)];
+      });
+      await Promise.race([
+        ready,
+        reading.then(() => {
+          throw new Error('Snapshot ended before its first read.');
+        }),
+      ]);
+      let timeout: ReturnType<typeof setTimeout> | undefined;
+      const concurrent = Promise.all([
+        f.call(f.worker.id, 'ticket_update', {
+          ticket_id: ticket.id,
+          expected_revision: ticket.revision,
+          priority: 1,
+        }),
+        f.storage.readSnapshot((reader) => reader.get('projects', f.project.id)),
+      ]);
+      let completed: boolean;
+      try {
+        completed = await Promise.race([
+          concurrent.then(() => true),
+          new Promise<boolean>((resolve) => {
+            timeout = setTimeout(() => resolve(false), 5000);
+          }),
+        ]);
+      } finally {
+        advance();
+        clearTimeout(timeout);
+      }
+      const [before, after] = await reading;
+      await concurrent;
+      assert.equal(completed, true, 'Snapshot serialized a concurrent mutation or reader.');
+      assert.deepEqual(after, before);
+      assert.equal(after?.priority, ticket.priority);
+      assert.equal((await f.storage.get('tickets', ticket.id))?.priority, 1);
+      await assert.rejects(
+        f.storage.readSnapshot(async () => {
+          throw new Error('abort snapshot');
+        }),
+        /abort snapshot/,
+      );
+      assert.equal((await f.storage.readSnapshot((reader) => reader.get('tickets', ticket.id)))?.priority, 1);
+    });
     check('grants exactly one concurrent claim', async (f) => {
       const ticket = await f.ticket();
       const attempts = await Promise.allSettled(
@@ -158,7 +220,8 @@ export function registerAdapterContractTests(name: string, factory: () => Promis
         ticket_id: ticket.id,
         detail: 'brief',
       })) as any;
-      assert.ok(!context.next_actions.includes('work_claim'));
+      assert.equal(context.claim.actor_id, winner.value.claim.actor_id);
+      assert.equal(context.claim.token, undefined);
     });
     check('atomically distributes next work to concurrent agents', async (f) => {
       for (let i = 0; i < 16; i++) await f.ticket();
