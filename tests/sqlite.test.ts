@@ -87,8 +87,14 @@ it('upgrades schema 001 without losing tickets and stores immutable GitHub evide
         at,
       );
       db.prepare(
-        "INSERT INTO tickets(id,project_id,key,title,description,status,priority,revision,requirements_revision,created_by,created_at,updated_at) VALUES(?,?,?,?,?,'ready',3,1,1,?,?,?)",
+        "INSERT INTO tickets(id,project_id,key,title,description,status,priority,revision,requirements_revision,created_by,created_at,updated_at) VALUES(?,?,?,?,?,'ready',3,8,1,?,?,?)",
       ).run(ticketId, projectId, 'OLD-1', 'Original ticket', 'Preserve this existing body.', actorId, at, at);
+      db.prepare("INSERT INTO search_documents VALUES(?,?,'ticket',8,?,?,0)").run(
+        ticketId,
+        projectId,
+        'Original ticket',
+        'Preserve this existing body.',
+      );
     } finally {
       db.close();
     }
@@ -96,6 +102,10 @@ it('upgrades schema 001 without losing tickets and stores immutable GitHub evide
     await a.storage.migrate();
     const original = (await a.storage.get('tickets', ticketId))!;
     assert.equal(original.description, 'Preserve this existing body.');
+    assert.equal(original.revision, 8);
+    const app = createApplication({ storage: a.storage, search: a.search });
+    assert.equal(await app.indexOnce(), 1);
+    assert.equal((await a.search.search(projectId, 'existing body', 10))[0]?.revision, 1);
     assert.equal(original.github_pull_request, undefined);
     assert.equal((await a.storage.get('actors', actorId))?.name, 'Original operator');
     assert.equal((await a.storage.get('projects', projectId))?.scheduling_policy, undefined);
@@ -111,7 +121,7 @@ it('upgrades schema 001 without losing tickets and stores immutable GitHub evide
       observed_head_sha: 'a'.repeat(40),
       status: 'passed' as const,
       requirements_revision: 1,
-      ticket_revision: 1,
+      ticket_revision: original.revision,
       checks: [
         {
           name: 'CI',
