@@ -10,9 +10,24 @@ const labels = z.array(text.max(80)).max(30);
 const page = { limit: z.int().min(1).max(100).default(10), offset: z.int().min(0).max(1_000_000).default(0) };
 const maxTokens = z.int().min(512).max(32768);
 const criteria = z.array(text.max(1000)).min(1).max(50);
+export const executionHintsSchema = z
+  .object({
+    model: z.string().trim().max(128).nullable().optional(),
+    effort: z.string().trim().max(32).nullable().optional(),
+  })
+  .strict()
+  .nullable()
+  .transform((value) => {
+    const hints = {
+      ...(value?.model ? { model: value.model } : {}),
+      ...(value?.effort ? { effort: value.effort } : {}),
+    };
+    return Object.keys(hints).length ? hints : null;
+  });
 const ticketFields = {
   title: text.max(300),
   description: text.max(16000),
+  execution_hints: executionHintsSchema.optional(),
   priority: z.int().min(1).max(5).default(3),
   labels: labels.default([]),
   capabilities: labels.default([]),
@@ -38,6 +53,7 @@ export const schemas = {
       name: text.max(200),
       instructions: z.string().max(16000).default(''),
       policy: z.enum(['self', 'independent', 'human']).default('independent'),
+      execution_hints: executionHintsSchema.optional(),
     })
     .strict(),
   project_update: z
@@ -48,6 +64,7 @@ export const schemas = {
       name: text.max(200).optional(),
       instructions: z.string().max(16000).optional(),
       policy: z.enum(['self', 'independent', 'human']).optional(),
+      execution_hints: executionHintsSchema.optional(),
     })
     .strict(),
   member_set: z
@@ -99,6 +116,7 @@ export const schemas = {
       ...revision,
       title: ticketFields.title.optional(),
       description: ticketFields.description.optional(),
+      execution_hints: executionHintsSchema.optional(),
       priority: z.int().min(1).max(5).optional(),
       labels: labels.optional(),
       capabilities: labels.optional(),

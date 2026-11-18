@@ -3,12 +3,16 @@ import type { Operation } from './schemas.js';
 const id = z.string(),
   timestamp = z.string(),
   json = z.json();
+const executionHints = z
+  .object({ model: z.string().min(1).max(128).optional(), effort: z.string().min(1).max(32).optional() })
+  .strict();
 const project = z.object({
   id,
   key: z.string(),
   name: z.string(),
   instructions: z.string(),
   policy: z.enum(['self', 'independent', 'human']),
+  execution_hints: executionHints.optional(),
   revision: z.number(),
   ticket_seq: z.number(),
   event_seq: z.number(),
@@ -20,6 +24,7 @@ const ticket = z.object({
   key: z.string(),
   title: z.string(),
   description: z.string(),
+  execution_hints: executionHints.optional(),
   status: z.enum(['backlog', 'ready', 'in_progress', 'in_review', 'done', 'cancelled']),
   priority: z.number(),
   labels: z.array(z.string()),
@@ -112,12 +117,14 @@ const visibleClaim = z
   .object({ actor_id: id, expires_at: timestamp, expired: z.boolean(), token: id.optional() })
   .nullable();
 const projectSummary = project.omit({
+  execution_hints: true,
   instructions: true,
   ticket_seq: true,
   event_seq: true,
   created_at: true,
 });
 const ticketSummary = ticket.omit({
+  execution_hints: true,
   description: true,
   created_by: true,
   created_at: true,
@@ -158,6 +165,7 @@ const context = z.discriminatedUnion('not_modified', [
     ticket,
     criteria: z.array(criterion),
     project_instructions: z.object({ text: z.string(), authority: z.string() }),
+    effective_execution_hints: executionHints.optional(),
     approval_policy: z.enum(['self', 'independent', 'human']),
     blockers: z.array(blocker),
     completion_blockers: z.array(blocker),
@@ -204,6 +212,7 @@ export const resultSchemas: Record<Operation, z.ZodType> = {
   ticket_transition: ticketReceipt,
   ticket_get: z.object({
     ticket,
+    effective_execution_hints: executionHints.optional(),
     criteria: z.array(criterion),
     links: z.array(link),
     claim: visibleClaim,

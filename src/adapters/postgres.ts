@@ -27,6 +27,7 @@ const columns: Record<Table, string[]> = {
     'name',
     'instructions',
     'policy',
+    'execution_hints',
     'revision',
     'ticket_seq',
     'event_seq',
@@ -39,6 +40,7 @@ const columns: Record<Table, string[]> = {
     'key',
     'title',
     'description',
+    'execution_hints',
     'status',
     'priority',
     'labels',
@@ -107,18 +109,27 @@ const columns: Record<Table, string[]> = {
     'last_error',
   ],
 };
-const jsonColumns = new Set(['metadata', 'evidence', 'data', 'result', 'requirements_snapshot']);
+const jsonColumns = new Set([
+  'metadata',
+  'evidence',
+  'data',
+  'result',
+  'requirements_snapshot',
+  'execution_hints',
+]);
 type Executor = Pick<pg.Pool, 'query'> | Pick<pg.PoolClient, 'query'>;
 function decode(row: Record<string, unknown>) {
   return Object.fromEntries(
-    Object.entries(row).map(([key, value]) => [
-      key,
-      value instanceof Date
-        ? value.toISOString()
-        : key === 'seq' || key === 'event_seq'
-          ? Number(value)
-          : value,
-    ]),
+    Object.entries(row)
+      .filter(([key, value]) => key !== 'execution_hints' || value !== null)
+      .map(([key, value]) => [
+        key,
+        value instanceof Date
+          ? value.toISOString()
+          : key === 'seq' || key === 'event_seq'
+            ? Number(value)
+            : value,
+      ]),
   );
 }
 function translate(error: unknown): never {
@@ -488,15 +499,17 @@ export class PostgresSearch implements SearchAdapter {
       });
     return [...merged.values()].sort((a, b) => b.score - a.score || a.id.localeCompare(b.id)).slice(0, limit);
   }
-  async coverage(projectId: string, profile: EmbeddingProfile) {
+  async coverage(projectId: string, profile?: EmbeddingProfile) {
     // shortcut: coverage is a five-second snapshot; use durable counters if exact live counts become necessary.
-    const key = `${projectId}:${profile.id}`;
+    const key = `${projectId}:${profile?.id ?? 'lexical'}`;
     const cached = this.coverageCache.get(key);
     if (cached && cached.expires > Date.now()) return cached.value;
     const value = this.pool
       .query(
-        `SELECT count(*)::integer documents,count(v.document_id)::integer embedded FROM search_documents d LEFT JOIN search_vectors v ON v.document_id=d.id AND v.revision=d.revision AND v.profile_id=$2 WHERE d.project_id=$1 AND NOT d.archived`,
-        [projectId, profile.id],
+        profile
+          ? `SELECT count(*)::integer documents,count(v.document_id)::integer embedded FROM search_documents d LEFT JOIN search_vectors v ON v.document_id=d.id AND v.revision=d.revision AND v.profile_id=$2 WHERE d.project_id=$1 AND NOT d.archived`
+          : 'SELECT count(*)::integer documents,0::integer embedded FROM search_documents WHERE project_id=$1 AND NOT archived',
+        profile ? [projectId, profile.id] : [projectId],
       )
       .then((result) => ({ ...result.rows[0], observed_at: new Date().toISOString() }))
       .catch((error) => {

@@ -10,12 +10,17 @@ export interface Actor {
   kind: 'human' | 'agent';
   system_admin: boolean;
 }
+export interface ExecutionHints {
+  model?: string;
+  effort?: string;
+}
 export interface Project {
   id: string;
   key: string;
   name: string;
   instructions: string;
   policy: Policy;
+  execution_hints?: ExecutionHints | null;
   revision: number;
   ticket_seq: number;
   event_seq: number;
@@ -33,6 +38,7 @@ export interface Ticket {
   key: string;
   title: string;
   description: string;
+  execution_hints?: ExecutionHints | null;
   status: Status;
   priority: number;
   labels: string[];
@@ -246,6 +252,7 @@ export interface EmbeddingProfile {
   dimensions: number;
 }
 export interface SearchAdapter {
+  readonly capabilities?: { semantic: boolean };
   configure(profile: EmbeddingProfile): Promise<void>;
   indexText(document: SearchDocument): Promise<void>;
   indexVector(
@@ -263,7 +270,7 @@ export interface SearchAdapter {
   ): Promise<SearchHit[]>;
   coverage(
     projectId: string,
-    profile: EmbeddingProfile,
+    profile?: EmbeddingProfile,
   ): Promise<{ documents: number; embedded: number; observed_at: string }>;
   health(): Promise<void>;
   close(): Promise<void>;

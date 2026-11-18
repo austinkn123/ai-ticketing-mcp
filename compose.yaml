@@ -5,6 +5,8 @@ x-runtime: &runtime
   init: true
   restart: unless-stopped
   environment: &environment
+    STORAGE_ADAPTER: ${STORAGE_ADAPTER:-postgres}
+    SQLITE_PATH: ${SQLITE_PATH:-}
     DATABASE_URL: postgresql://ticketing_app:${APP_DB_PASSWORD:?Run node scripts/setup.mjs}@db:5432/ticketing
     EMBEDDING_PROVIDER: ${EMBEDDING_PROVIDER:-ollama}
     EMBEDDING_URL: ${EMBEDDING_URL:-http://ollama:11434}

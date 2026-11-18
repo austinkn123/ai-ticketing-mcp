@@ -1,33 +1,50 @@
 import { PostgresStorage, PostgresSearch } from './adapters/postgres.js';
+import { createSqliteAdapters } from './adapters/sqlite.js';
 import { HttpEmbeddings } from './adapters/embeddings.js';
 import { createApplication } from './application.js';
-import { ensure } from './contracts.js';
+import { ensure, type StorageAdapter, type SearchAdapter, type EmbeddingProvider } from './contracts.js';
 export function createRuntime(env: NodeJS.ProcessEnv = process.env) {
-  ensure(env.DATABASE_URL, 'INVALID_CONFIG', 'DATABASE_URL is required.');
-  const storage = new PostgresStorage(env.DATABASE_URL);
-  const search = new PostgresSearch(storage.pool);
-  const provider = env.EMBEDDING_PROVIDER ?? 'ollama';
+  const adapter = env.STORAGE_ADAPTER ?? 'postgres';
   ensure(
-    provider === 'ollama' || provider === 'openai',
+    adapter === 'postgres' || adapter === 'sqlite',
     'INVALID_CONFIG',
-    'EMBEDDING_PROVIDER must be ollama or openai.',
+    'STORAGE_ADAPTER must be postgres or sqlite.',
   );
-  if (provider === 'openai')
-    ensure(
-      env.EMBEDDING_URL && env.EMBEDDING_MODEL && env.EMBEDDING_DIMENSIONS,
-      'INVALID_CONFIG',
-      'Hosted embeddings require EMBEDDING_URL, EMBEDDING_MODEL, and EMBEDDING_DIMENSIONS.',
-    );
-  const embeddings = new HttpEmbeddings({
-    provider,
-    url: env.EMBEDDING_URL ?? 'http://127.0.0.1:11434',
-    model: env.EMBEDDING_MODEL ?? 'nomic-embed-text',
-    dimensions: Number(env.EMBEDDING_DIMENSIONS ?? 768),
-    apiKey: env.EMBEDDING_API_KEY,
-    revision: env.EMBEDDING_REVISION ?? '1',
-    spaceId: env.EMBEDDING_SPACE_ID?.trim() || undefined,
-    timeoutMs: Number(env.EMBEDDING_TIMEOUT_MS ?? 30000),
-  });
+  let storage: StorageAdapter;
+  let search: SearchAdapter;
+  if (adapter === 'sqlite')
+    ({ storage, search } = createSqliteAdapters(env.SQLITE_PATH?.trim() ? env.SQLITE_PATH : undefined));
+  else {
+    ensure(env.DATABASE_URL, 'INVALID_CONFIG', 'DATABASE_URL is required.');
+    const postgres = new PostgresStorage(env.DATABASE_URL);
+    storage = postgres;
+    search = new PostgresSearch(postgres.pool);
+  }
+  const provider = env.EMBEDDING_PROVIDER ?? (adapter === 'sqlite' ? 'none' : 'ollama');
+  ensure(
+    ['none', 'ollama', 'openai'].includes(provider),
+    'INVALID_CONFIG',
+    'EMBEDDING_PROVIDER must be none, ollama, or openai.',
+  );
+  let embeddings: EmbeddingProvider | undefined;
+  if (provider !== 'none' && search.capabilities?.semantic !== false) {
+    if (provider === 'openai')
+      ensure(
+        env.EMBEDDING_URL && env.EMBEDDING_MODEL && env.EMBEDDING_DIMENSIONS,
+        'INVALID_CONFIG',
+        'Hosted embeddings require EMBEDDING_URL, EMBEDDING_MODEL, and EMBEDDING_DIMENSIONS.',
+      );
+    embeddings = new HttpEmbeddings({
+      provider: provider as 'ollama' | 'openai',
+      url: env.EMBEDDING_URL ?? 'http://127.0.0.1:11434',
+      model: env.EMBEDDING_MODEL ?? 'nomic-embed-text',
+      dimensions: Number(env.EMBEDDING_DIMENSIONS ?? 768),
+      apiKey: env.EMBEDDING_API_KEY,
+      revision: env.EMBEDDING_REVISION ?? '1',
+      spaceId: env.EMBEDDING_SPACE_ID?.trim() || undefined,
+      timeoutMs: Number(env.EMBEDDING_TIMEOUT_MS ?? 30000),
+    });
+  }
   return createApplication({
     storage,
     search,

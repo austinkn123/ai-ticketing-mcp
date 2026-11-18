@@ -23,6 +23,7 @@ const { positionals, values } = parseArgs({
     admin: { type: 'boolean' },
     project: { type: 'string' },
     profile: { type: 'string' },
+    sqlite: { type: 'string' },
     operation: { type: 'string' },
     input: { type: 'string' },
     'input-file': { type: 'string' },
@@ -67,13 +68,23 @@ async function main() {
     }
     return;
   }
-  const app = createRuntime();
+  ensure(
+    values.sqlite === undefined || values.sqlite.trim().length > 0,
+    'INVALID_INPUT',
+    '--sqlite requires a file path.',
+  );
+  const runtimeEnv =
+    values.sqlite === undefined
+      ? process.env
+      : { ...process.env, STORAGE_ADAPTER: 'sqlite', SQLITE_PATH: values.sqlite };
+  const app = createRuntime(runtimeEnv);
   let keepAlive = false;
   try {
     if (command === 'migrate') {
       await app.storage.migrate();
-      await app.searchAdapter.configure(app.embeddings.profile);
-      print({ migrated: true, embedding_profile: app.embeddings.profile });
+      if (app.embeddings && app.searchAdapter.capabilities?.semantic !== false)
+        await app.searchAdapter.configure(app.embeddings.profile);
+      print({ migrated: true, embedding_profile: app.embeddings?.profile ?? null });
       return;
     }
     if (command === 'actor') {
@@ -101,7 +112,7 @@ async function main() {
       print(result);
       return;
     }
-    const actorId = values.actor ?? process.env.ACTOR_ID;
+    let actorId = values.actor ?? process.env.ACTOR_ID;
     if (command === 'call') {
       ensure(actorId && values.operation, 'INVALID_INPUT', 'call requires --actor and --operation.');
       print(await app.execute(actorId, values.operation as Operation, await input()));
@@ -109,7 +120,8 @@ async function main() {
     }
     if (command === 'reindex') {
       ensure(actorId && values.project, 'INVALID_INPUT', 'reindex requires --actor and --project.');
-      await app.searchAdapter.configure(app.embeddings.profile);
+      if (app.embeddings && app.searchAdapter.capabilities?.semantic !== false)
+        await app.searchAdapter.configure(app.embeddings.profile);
       print(await app.rebuild(actorId, values.project));
       return;
     }
@@ -141,6 +153,33 @@ async function main() {
       return;
     }
     if (command === 'stdio') {
+      if (runtimeEnv.STORAGE_ADAPTER === 'sqlite') {
+        await app.storage.migrate();
+        if (!actorId)
+          actorId = await app.storage.transaction('catalog', async (tx) => {
+            const previous = (
+              await tx.find('actors', { where: { issuer: 'local-stdio', subject: 'local-mcp' }, limit: 1 })
+            )[0];
+            if (previous) {
+              ensure(
+                previous.kind === 'agent',
+                'INVALID_CONFIG',
+                'The default local MCP identity must be an agent.',
+              );
+              return previous.id;
+            }
+            const actor: Actor = {
+              id: randomUUID(),
+              issuer: 'local-stdio',
+              subject: 'local-mcp',
+              name: 'Local MCP agent',
+              kind: 'agent',
+              system_admin: true,
+            };
+            await tx.put('actors', actor);
+            return actor.id;
+          });
+      }
       ensure(actorId, 'INVALID_CONFIG', 'ACTOR_ID is required for trusted local stdio.');
       await app.actor(actorId);
       const server = createMcpServer(
@@ -155,6 +194,7 @@ async function main() {
       keepAlive = true;
       const shutdown = async () => {
         await server.close();
+        await app.searchAdapter.close();
         await app.storage.close();
       };
       process.once('SIGINT', () => void shutdown());

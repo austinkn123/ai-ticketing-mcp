@@ -11,5 +11,6 @@ export { serializeSuccessEnvelope } from './envelope.js';
 export { createHttpServer } from './http.js';
 export { createAuthenticator } from './auth.js';
 export { HttpEmbeddings } from './adapters/embeddings.js';
+export { createSqliteAdapters } from './adapters/sqlite.js';
 export { CachedEmbeddings } from './query-embeddings.js';
 export { countReferenceTokens } from './tokens.js';

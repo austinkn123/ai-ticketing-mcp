@@ -14,7 +14,8 @@
     ".": "./dist/index.js",
     "./contracts": "./dist/contracts.js",
     "./testing": "./dist/testing/contracts.js",
-    "./postgres": "./dist/adapters/postgres.js"
+    "./postgres": "./dist/adapters/postgres.js",
+    "./sqlite": "./dist/adapters/sqlite.js"
   },
   "files": [
     "dist",

@@ -2,9 +2,17 @@
 
 ## Schema and roles
 
-`migrate` applies numbered SQL files atomically and records them in `schema_migrations`. A database advisory lock serializes migration runners. Compose uses `ticketing_owner` for migrations and `ticketing_app` for normal work. The runtime role can read/write application tables but cannot create schema objects. The initial PostgreSQL container script creates roles only on an empty volume; changing `.env` later does not rotate existing database passwords.
+`migrate` applies numbered SQL files atomically and records them in `schema_migrations`. PostgreSQL uses a database advisory lock to serialize migration runners. Compose uses `ticketing_owner` for migrations and `ticketing_app` for normal work. The runtime role can read/write application tables but cannot create schema objects. The initial PostgreSQL container script creates roles only on an empty volume; changing `.env` later does not rotate existing database passwords.
 
 Do not run automatic migrations from every HTTP process. Compose runs an explicit migration job before application and worker startup. For another backend, use its adapter-owned migration operation.
+
+## SQLite local operation
+
+Select `STORAGE_ADAPTER=sqlite` and `SQLITE_PATH` for the persistent file, or use the CLI's `--sqlite PATH` convenience flag. SQLite stdio bootstraps its schema automatically. `EMBEDDING_PROVIDER=none` avoids external inference; SQLite search always uses FTS5 and explicitly reports full-text-only capability. Run the indexing worker when source records change so lexical search reaches the latest revisions.
+
+Keep the database on a local filesystem. WAL mode allows coherent read snapshots alongside a writer, but only one write transaction can commit at a time across all projects. Long-lived snapshots retain WAL pages. Synchronous SQLite statements run on the Node event loop; use PostgreSQL for workloads requiring greater write concurrency or a shared database service.
+
+The database, `-wal`, and `-shm` files contain trusted local state, including claim credentials. Protect them with operating-system permissions. New database files use owner-only permissions where supported; existing permissions are preserved. A local operator who can access the file can administer its contents. Close both storage and search handles before copying the database alone for an offline backup; copying a live main file without its WAL can omit committed work. Restore into a separate file and verify reads before switching clients. Existing files, receipts, and audit history are never reset by startup.
 
 ## Search and model changes
 

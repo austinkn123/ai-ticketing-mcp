@@ -16,6 +16,7 @@ import {
   type Knowledge,
   type SearchDocument,
   type Submission,
+  type ExecutionHints,
 } from './contracts.js';
 import { resultSchemas } from './result-schemas.js';
 import { serializeSuccessEnvelope } from './envelope.js';
@@ -25,7 +26,7 @@ import { CachedEmbeddings } from './query-embeddings.js';
 export interface ApplicationOptions {
   storage: StorageAdapter;
   search: SearchAdapter;
-  embeddings: EmbeddingProvider;
+  embeddings?: EmbeddingProvider;
   now?: () => Date;
   countReferenceTokens?: (text: string) => number;
   referenceTokenMetrics?: boolean;
@@ -46,7 +47,7 @@ const digest = (value: unknown) => createHash('sha256').update(canonical(value))
 export class Application {
   readonly storage: StorageAdapter;
   readonly searchAdapter: SearchAdapter;
-  readonly embeddings: CachedEmbeddings;
+  readonly embeddings?: CachedEmbeddings;
   private now: () => Date;
   private countTokens: (text: string) => number;
   private referenceTokenMetrics: boolean;
@@ -64,10 +65,11 @@ export class Application {
   constructor(options: ApplicationOptions) {
     this.storage = options.storage;
     this.searchAdapter = options.search;
-    this.embeddings =
-      options.embeddings instanceof CachedEmbeddings
+    this.embeddings = options.embeddings
+      ? options.embeddings instanceof CachedEmbeddings
         ? options.embeddings
-        : new CachedEmbeddings(options.embeddings);
+        : new CachedEmbeddings(options.embeddings)
+      : undefined;
     this.now = options.now ?? (() => new Date());
     this.countTokens = options.countReferenceTokens ?? countReferenceTokens;
     this.referenceTokenMetrics = options.referenceTokenMetrics === true;
@@ -122,6 +124,8 @@ export class Application {
       'FORBIDDEN',
       'Project not found or access denied.',
     );
+    if (!project.execution_hints || !Object.keys(project.execution_hints).length)
+      delete project.execution_hints;
     return project;
   }
   private async ticket(reader: Reader, projectId: string, reference: string) {
@@ -129,7 +133,12 @@ export class Application {
       ? await reader.get('tickets', reference)
       : (await reader.find('tickets', { where: { project_id: projectId, key: reference }, limit: 1 }))[0];
     ensure(ticket && ticket.project_id === projectId, 'NOT_FOUND', 'Ticket not found in this project.');
+    if (!ticket.execution_hints || !Object.keys(ticket.execution_hints).length) delete ticket.execution_hints;
     return ticket;
+  }
+  private executionHints(project: Project, ticket: Ticket): ExecutionHints | undefined {
+    const hints = { ...project.execution_hints, ...ticket.execution_hints };
+    return Object.keys(hints).length ? hints : undefined;
   }
   private version(record: { revision: number }, expected: number) {
     ensure(
@@ -518,6 +527,7 @@ export class Application {
             name: data.name,
             instructions: data.instructions,
             policy: data.policy,
+            ...(data.execution_hints ? { execution_hints: data.execution_hints } : {}),
             revision: 1,
             ticket_seq: 0,
             event_seq: 0,
@@ -537,6 +547,10 @@ export class Application {
           this.version(project, input.expected_revision);
           for (const key of ['name', 'instructions', 'policy'] as const)
             if (input[key] !== undefined) (project as any)[key] = input[key];
+          if (input.execution_hints !== undefined) {
+            if (input.execution_hints) project.execution_hints = input.execution_hints;
+            else delete project.execution_hints;
+          }
           project.revision++;
           await this.event(tx, project, actor, 'project.updated', project.id, { revision: project.revision });
           return project;
@@ -568,6 +582,7 @@ export class Application {
               key: `${project.key}-${++project.ticket_seq}`,
               title: item.title,
               description: item.description,
+              ...(item.execution_hints ? { execution_hints: item.execution_hints } : {}),
               status: item.status,
               priority: item.priority,
               labels: item.labels,
@@ -727,6 +742,10 @@ export class Application {
     switch (operation) {
       case 'ticket_update': {
         this.version(ticket, input.expected_revision);
+        if (input.execution_hints !== undefined) {
+          if (input.execution_hints) ticket.execution_hints = input.execution_hints;
+          else delete ticket.execution_hints;
+        }
         if (input.assignee_id)
           await this.access(tx, await this.actor(input.assignee_id, tx), project.id, [
             'contributor',
@@ -963,11 +982,12 @@ export class Application {
   }
   private async details(
     reader: Reader,
-    projectId: string,
+    project: Project,
     ticket: Ticket,
     actor: Actor,
     at = this.timestamp(),
   ) {
+    const projectId = project.id;
     const [criteria, links, claim, blockers] = await Promise.all([
       reader.find('criteria', {
         where: { project_id: projectId, ticket_id: ticket.id },
@@ -977,8 +997,10 @@ export class Application {
       reader.get('claims', ticket.id),
       this.blockers(reader, ticket),
     ]);
+    const executionHints = this.executionHints(project, ticket);
     return {
       ticket,
+      ...(executionHints ? { effective_execution_hints: executionHints } : {}),
       criteria,
       links,
       claim: claim
@@ -1059,7 +1081,7 @@ export class Application {
       case 'ticket_get':
         return this.details(
           this.storage,
-          project.id,
+          project,
           await this.ticket(this.storage, project.id, input.ticket_id),
           actor,
         );
@@ -1230,14 +1252,14 @@ export class Application {
   private async search(actor: Actor, input: Input<'search'>) {
     let degraded: string | null = null;
     let semantic;
-    try {
-      semantic = {
-        profile: this.embeddings.profile,
-        vector: await this.embeddings.embed(input.query, 'query'),
-      };
-    } catch {
-      degraded = 'Embedding provider unavailable; returning full-text results.';
-    }
+    const embeddings = this.searchAdapter.capabilities?.semantic === false ? undefined : this.embeddings;
+    if (embeddings) {
+      try {
+        semantic = { profile: embeddings.profile, vector: await embeddings.embed(input.query, 'query') };
+      } catch {
+        degraded = 'Embedding provider unavailable; returning full-text results.';
+      }
+    } else degraded = 'Semantic search is disabled; returning full-text results.';
     const hits = await this.searchAdapter.search(
       input.project_id,
       input.query,
@@ -1294,7 +1316,7 @@ export class Application {
     }
     // Recheck grants after provider/network calls so a revoked identity cannot receive cached candidates.
     await this.access(this.storage, actor, input.project_id);
-    const coverage = await this.searchAdapter.coverage(input.project_id, this.embeddings.profile);
+    const coverage = await this.searchAdapter.coverage(input.project_id, embeddings?.profile);
     if (!degraded && coverage.embedded < coverage.documents)
       degraded = 'Semantic indexing is incomplete; full-text results remain available.';
     return { results, degraded, coverage, index_consistency: 'eventual' };
@@ -1316,7 +1338,7 @@ export class Application {
   ) {
     const at = this.timestamp();
     const ticket = await this.ticket(reader, project.id, input.ticket_id);
-    const detail = await this.details(reader, project.id, ticket, actor, at);
+    const detail = await this.details(reader, project, ticket, actor, at);
     ensure(
       detail.links.length <= 10000,
       'GRAPH_LIMIT',
@@ -1437,6 +1459,9 @@ export class Application {
       fingerprint,
       not_modified: false,
       ticket,
+      ...(detail.effective_execution_hints
+        ? { effective_execution_hints: detail.effective_execution_hints }
+        : {}),
       criteria: detail.criteria,
       project_instructions: { text: project.instructions, authority: 'project_administrator' },
       approval_policy: project.policy,
@@ -1637,7 +1662,7 @@ export class Application {
         const document = await this.sourceDocument(this.storage, job.kind, job.entity_id);
         if (document) {
           await this.searchAdapter.indexText(document);
-          if (!document.archived) {
+          if (!document.archived && this.embeddings && this.searchAdapter.capabilities?.semantic !== false) {
             const text = `${document.title}\n${document.text}`;
             const inputHash = createHash('sha256').update(text).digest('hex');
             if (await this.searchAdapter.reuseVector?.(document, this.embeddings.profile, inputHash)) {

@@ -1,12 +1,14 @@
 # Adapter development
 
-The application owns workflow, permissions, review policy, graph validation, and context assembly. MCP is a transport over those operations. PostgreSQL types and SQL appear only in the default adapter, its migrations, and backend-specific operational scripts.
+The application owns workflow, permissions, review policy, graph validation, and context assembly. MCP is a transport over those operations. Backend-specific types and SQL remain inside adapters, their migrations, and operational scripts.
 
 ## Interfaces
 
 `StorageAdapter` provides typed reads, consistent read-only snapshots, bounded filtered queries, an ordered work-candidate query, atomic transactions, durable job leasing, migration, health, metrics, and shutdown. `Transaction` adds record writes and removal. Dates cross this boundary as UTC ISO strings, identifiers as strings, and events as safe integer sequences. JSON fields contain validated evidence or metadata.
 
 `SearchAdapter` prepares an embedding profile, indexes text and vectors, retrieves candidates, reports coverage, checks health, and closes. It can share a database with storage or use a separate service. Search returns source identifiers and revisions; the application rechecks access, archive state, and revision against authoritative storage before returning text.
+
+Optional `capabilities.semantic:false` declares full-text-only search. The application skips query/document embeddings and reports the capability explicitly; absent capabilities preserve semantic support. Coverage accepts an optional profile and reports zero embedded documents when no profile or vector support is available. `ApplicationOptions.embeddings` may be omitted for full-text operation.
 
 `EmbeddingProvider` exposes its model/profile/dimensions and generates query/document vectors. The supplied HTTP implementation supports Ollama and OpenAI-compatible APIs. Document inputs are split into 6,000-character pieces; normalized mean pooling includes every piece in one document vector. This favors a small index over passage-level semantic precision. Changing the chunking algorithm requires a new profile and reindexing.
 
@@ -26,6 +28,26 @@ The application owns workflow, permissions, review policy, graph validation, and
 A non-SQL backend can implement these operations using its native transactions and conditional writes. A backend unable to supply the guarantees is not a compatible production adapter. Do not emulate a transaction by saving records one by one without atomic rollback.
 
 Existing custom storage adapters must add `readSnapshot` before upgrading. Use a native consistent read-only snapshot or equivalent view; routing it through the project mutation lock defeats the standalone-context concurrency guarantee.
+
+## SQLite adapters
+
+Node 24's built-in SQLite and FTS5 implementation is available through one coordinated factory:
+
+```ts
+import { createSqliteAdapters } from 'ai-ticketing-mcp/sqlite';
+
+const { storage, search } = createSqliteAdapters('.local/ticketing.sqlite');
+await storage.migrate();
+// Supply storage/search to createApplication; no embedding provider is required.
+// After stopping requests and indexing:
+await Promise.all([search.close(), storage.close()]);
+```
+
+The default path is `.local/ticketing.sqlite`; blank paths and `:memory:` are rejected because isolated readers require the same persistent file. Numbered migrations under `migrations/sqlite` preserve existing records. Project/ticket execution hints are nullable JSON columns; unset hints decode as absent fields.
+
+WAL mode separates plain reads and read-only snapshots from the writer connection. Async transaction callbacks retain atomic rollback and never expose pending writes to outside readers. Every storage/search factory for the same canonical file shares an in-process writer queue. SQLite serializes all writes to that file across project scopes; other processes retry writer-lock acquisition asynchronously for up to five seconds. Use the callback's `tx.put/remove` for record changes; nested standalone writes are rejected instead of waiting on their own transaction. Document indexing runs after commit through durable jobs.
+
+FTS5 matches query words with AND, ranks lexical matches with BM25, and breaks ties by source ID. Revision/archive guards match the storage contract. Vector indexing is explicitly unsupported, and coverage reports zero embeddings. Both close methods are idempotent; each handle waits for its queued work, and the shared writer closes after the final handle. Independent snapshots finish before their storage handle closes.
 
 ## Wiring a replacement
 
