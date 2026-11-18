@@ -3,10 +3,11 @@ import assert from 'node:assert/strict';
 import { mkdtemp, rm, readFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, dirname, basename, resolve } from 'node:path';
-import { spawn } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
 import { once } from 'node:events';
+import { promisify } from 'node:util';
 import { createSqliteAdapters } from '../src/adapters/sqlite.js';
 import { createApplication } from '../src/application.js';
 import { fixture, registerAdapterContractTests, testEmbeddings } from '../src/testing/contracts.js';
@@ -59,6 +60,47 @@ async function deliveryRecord(
   };
 }
 registerAdapterContractTests('SQLite', adapters);
+
+it('prunes old receipts only when worker retention is configured', async () => {
+  const f = await setup();
+  try {
+    const input = {
+      idempotency_key: randomUUID(),
+      tickets: [{ title: 'Retain a receipt', description: 'Retry safely.', criteria: ['Create once.'] }],
+    };
+    const create = () => f.call(f.worker.id, 'tickets_create', input);
+    const first = await create();
+    await f.storage.transaction(f.project.id, async (tx) => {
+      const [receipt] = await tx.find('receipts', {
+        where: { project_id: f.project.id, operation: 'tickets_create' },
+      });
+      assert.ok(receipt);
+      await tx.put('receipts', { ...receipt, created_at: '2000-01-01T00:00:00.000Z' });
+    });
+    const env: NodeJS.ProcessEnv = {
+      ...process.env,
+      TICKETING_WEBHOOK_URL: '',
+      TICKETING_WEBHOOK_SECRET: '',
+    };
+    delete env.RECEIPT_RETENTION_DAYS;
+    const worker = (env: NodeJS.ProcessEnv) =>
+      promisify(execFile)(
+        process.execPath,
+        ['--import', 'tsx', 'src/cli.ts', 'worker', '--once', '--sqlite', f.filename],
+        {
+          env,
+          timeout: 10000,
+          windowsHide: true,
+        },
+      );
+    await worker(env);
+    assert.deepEqual(await create(), first);
+    await worker({ ...env, RECEIPT_RETENTION_DAYS: '30' });
+    assert.notDeepEqual(await create(), first);
+  } finally {
+    await f.dispose();
+  }
+});
 
 it('upgrades schema 001 without losing tickets and stores immutable GitHub evidence', async () => {
   const a = await adapters();

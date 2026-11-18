@@ -192,17 +192,18 @@ async function main() {
       };
       process.once('SIGINT', stop);
       process.once('SIGTERM', stop);
-      const retentionDays = Number(runtimeEnv.RECEIPT_RETENTION_DAYS ?? 30);
-      const retentionMs = retentionDays * 86_400_000;
+      const retention = runtimeEnv.RECEIPT_RETENTION_DAYS?.trim();
+      const retentionMs = retention ? Number(retention) * 86_400_000 : undefined;
       ensure(
-        retentionDays >= 1 && Number.isFinite(new Date(Date.now() - retentionMs).getTime()),
+        retentionMs === undefined ||
+          (retentionMs >= 86_400_000 && Number.isFinite(new Date(Date.now() - retentionMs).getTime())),
         'INVALID_CONFIG',
         'RECEIPT_RETENTION_DAYS must be at least 1 and give a valid date.',
       );
       let pruneAt = 0;
       const index = async () => {
         const now = Date.now();
-        if (app.storage.pruneReceipts && now >= pruneAt) {
+        if (retentionMs !== undefined && app.storage.pruneReceipts && now >= pruneAt) {
           await app.storage.pruneReceipts(new Date(now - retentionMs).toISOString());
           pruneAt = now + 3_600_000;
         }

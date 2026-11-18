@@ -404,7 +404,12 @@ export class Application {
       project_id: entity.project_id,
       entity_id: entity.id,
       kind,
-      revision: 'revision' in entity ? entity.revision : entity.ticket_revision,
+      revision:
+        'requirements_revision' in entity
+          ? entity.requirements_revision
+          : 'revision' in entity
+            ? entity.revision
+            : entity.ticket_revision,
       attempts: 0,
       available_at: this.timestamp(),
       locked_until: null,
@@ -416,7 +421,6 @@ export class Application {
     ticket.revision++;
     ticket.updated_at = this.timestamp();
     await tx.put('tickets', ticket);
-    await this.queue(tx, ticket, 'ticket');
   }
   private async scoped(
     actorId: string,
@@ -671,6 +675,7 @@ export class Application {
       if (['done', 'in_review', 'in_progress'].includes(current.status)) current.status = 'ready';
       await tx.remove('claims', current.id);
       await this.touch(tx, current);
+      await this.queue(tx, current, 'ticket');
       await this.event(tx, project, actor, 'ticket.invalidated', current.id, {
         reason,
         revision: current.revision,
