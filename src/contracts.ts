@@ -2,6 +2,7 @@
 export type Status = 'backlog' | 'ready' | 'in_progress' | 'in_review' | 'done' | 'cancelled';
 export type Role = 'reader' | 'contributor' | 'verifier' | 'admin';
 export type Policy = 'self' | 'independent' | 'human';
+export type SchedulingPolicy = 'priority_age' | 'unblocking';
 export interface Actor {
   id: string;
   issuer: string;
@@ -10,12 +11,18 @@ export interface Actor {
   kind: 'human' | 'agent';
   system_admin: boolean;
 }
+export interface ExecutionHints {
+  model?: string;
+  effort?: string;
+}
 export interface Project {
   id: string;
   key: string;
   name: string;
   instructions: string;
   policy: Policy;
+  scheduling_policy?: SchedulingPolicy;
+  execution_hints?: ExecutionHints | null;
   revision: number;
   ticket_seq: number;
   event_seq: number;
@@ -33,6 +40,8 @@ export interface Ticket {
   key: string;
   title: string;
   description: string;
+  execution_hints?: ExecutionHints | null;
+  github_pull_request?: { repository: string; number: number } | null;
   status: Status;
   priority: number;
   labels: string[];
@@ -144,6 +153,42 @@ export interface Receipt {
   result: unknown;
   created_at: string;
 }
+export type GitHubCIStatus = 'passed' | 'pending' | 'failed' | 'missing' | 'stale';
+export interface GitHubCheck {
+  name: string;
+  required_app_id: number;
+  run_id: number | null;
+  app_id: number | null;
+  head_sha: string | null;
+  status: string;
+  conclusion: string | null;
+  url: string | null;
+}
+export interface GitHubObservation {
+  head_sha: string;
+  observed_head_sha: string;
+  status: GitHubCIStatus;
+  checks: GitHubCheck[];
+}
+export interface GitHubConfiguration {
+  repository: string;
+  required_checks: readonly string[];
+  check_app_id: number;
+}
+export interface GitHubProvider {
+  inspect(configuration: GitHubConfiguration, pullRequest: number): Promise<GitHubObservation>;
+}
+export interface GitHubEvidence extends GitHubObservation {
+  id: string;
+  project_id: string;
+  ticket_id: string;
+  actor_id: string;
+  repository: string;
+  pull_request_number: number;
+  requirements_revision: number;
+  ticket_revision: number;
+  observed_at: string;
+}
 export interface Job {
   id: string;
   project_id: string;
@@ -156,7 +201,34 @@ export interface Job {
   lock_token: string | null;
   last_error: string | null;
 }
+export interface OutboundDelivery {
+  id: string;
+  event_id: string;
+  project_id: string;
+  /** Exact JSON text, reused unchanged across delivery attempts. */
+  body: string;
+  target_fingerprint: string;
+  attempt_count: number;
+  next_attempt_at: string;
+  locked_until: string | null;
+  lock_token: string | null;
+  sent_at: string | null;
+  last_error: string | null;
+  created_at: string;
+}
+export type DeliveryOutcome = { sent_at: string } | { next_attempt_at: string; error_code: string };
+export interface DeliveryMetrics {
+  webhook_pending: number;
+  webhook_failed: number;
+  webhook_attempts: number;
+}
+export interface WebhookTarget {
+  readonly fingerprint: string;
+  send(delivery: OutboundDelivery): Promise<{ error_code: string } | undefined>;
+}
 export interface Tables {
+  outbound_deliveries: OutboundDelivery;
+  github_evidence: GitHubEvidence;
   actors: Actor;
   projects: Project;
   members: Member;
@@ -197,6 +269,7 @@ export interface Reader {
     now: string,
     limit: number,
     offset: number,
+    policy?: SchedulingPolicy,
   ): Promise<Ticket[]>;
   get<K extends Table>(table: K, id: string): Promise<Tables[K] | null>;
   find<K extends Table>(table: K, query?: Query<Tables[K]>): Promise<Tables[K][]>;
@@ -206,6 +279,8 @@ export interface Transaction extends Reader {
   remove<K extends Table>(table: K, id: string): Promise<void>;
 }
 export interface StorageAdapter extends Reader {
+  /** Absent capabilities support only the legacy priority_age ordering. */
+  readonly schedulingPolicies?: readonly SchedulingPolicy[];
   /** One consistent read-only view, independent of project mutation locks. */
   readSnapshot<T>(work: (reader: Reader) => Promise<T>): Promise<T>;
   /** Serializes mutations in a scope, commits atomically, and rolls back on failure. */
@@ -213,6 +288,10 @@ export interface StorageAdapter extends Reader {
   /** Atomically leases durable jobs, including abandoned jobs whose lease expired. */
   leaseJobs(limit: number, leaseMs: number): Promise<Job[]>;
   finishJob(job: Job, error?: string): Promise<void>;
+  /** Atomically leases 1–100 due rows for this target; lease is 1–3,600,000 ms. */
+  leaseDeliveries?(targetFingerprint: string, limit: number, leaseMs: number): Promise<OutboundDelivery[]>;
+  finishDelivery?(delivery: OutboundDelivery, outcome: DeliveryOutcome): Promise<void>;
+  deliveryMetrics?(): Promise<DeliveryMetrics>;
   metrics(): Promise<{
     active_claims: number;
     expired_claims: number;
@@ -246,6 +325,7 @@ export interface EmbeddingProfile {
   dimensions: number;
 }
 export interface SearchAdapter {
+  readonly capabilities?: { semantic: boolean };
   configure(profile: EmbeddingProfile): Promise<void>;
   indexText(document: SearchDocument): Promise<void>;
   indexVector(
@@ -263,7 +343,7 @@ export interface SearchAdapter {
   ): Promise<SearchHit[]>;
   coverage(
     projectId: string,
-    profile: EmbeddingProfile,
+    profile?: EmbeddingProfile,
   ): Promise<{ documents: number; embedded: number; observed_at: string }>;
   health(): Promise<void>;
   close(): Promise<void>;
@@ -289,4 +369,28 @@ export function ensure(
   details: Record<string, unknown> = {},
 ): asserts condition {
   if (!condition) throw new DomainError(code, message, details);
+}
+export function validateGitHubConfiguration(configuration: GitHubConfiguration): void {
+  ensure(
+    /^[A-Za-z0-9][A-Za-z0-9-]{0,38}\/[A-Za-z0-9_.-]{1,100}$/.test(configuration.repository) &&
+      !['.', '..'].includes(configuration.repository.split('/')[1]!),
+    'INVALID_CONFIG',
+    'Configure a trusted owner/repository.',
+  );
+  ensure(
+    Array.isArray(configuration.required_checks) &&
+      configuration.required_checks.length >= 1 &&
+      configuration.required_checks.length <= 20 &&
+      configuration.required_checks.every(
+        (name) => typeof name === 'string' && name.trim().length > 0 && name.length <= 200,
+      ) &&
+      new Set(configuration.required_checks).size === configuration.required_checks.length,
+    'INVALID_CONFIG',
+    'Configure 1–20 distinct required GitHub check names.',
+  );
+  ensure(
+    Number.isSafeInteger(configuration.check_app_id) && configuration.check_app_id > 0,
+    'INVALID_CONFIG',
+    'Configure the trusted GitHub check app ID.',
+  );
 }

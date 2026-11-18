@@ -12,12 +12,12 @@ The default profile is `worker`. Select `stdio --profile worker|planner|reviewer
 
 Every profile includes `project_list`, `project_get`, `ticket_list`, `ticket_context`, `ticket_get`, `ticket_history`, `search`, `knowledge_get`, `checkpoint_get`, and `changes_since`.
 
-| Profile               | Additional tools                                                                                        | Prompts            |
-| --------------------- | ------------------------------------------------------------------------------------------------------- | ------------------ |
-| `worker` (16 tools)   | `work_claim`, `work_heartbeat`, `work_release`, `ticket_checkpoint`, `ticket_note`, `ticket_submit`     | execution, handoff |
-| `planner` (16 tools)  | `tickets_create`, `ticket_update`, `ticket_transition`, `ticket_link`, `ticket_note`, `knowledge_write` | planning           |
-| `reviewer` (12 tools) | `ticket_review`, `ticket_note`                                                                          | verification       |
-| `full` (26 tools)     | All tools below, including project administration and `work_next`                                       | all four           |
+| Profile               | Additional tools                                                                                                                 | Prompts            |
+| --------------------- | -------------------------------------------------------------------------------------------------------------------------------- | ------------------ |
+| `worker` (16 tools)   | `work_claim`, `work_heartbeat`, `work_release`, `ticket_checkpoint`, `ticket_note`, `ticket_submit`                              | execution, handoff |
+| `planner` (17 tools)  | `tickets_create`, `ticket_update`, `ticket_transition`, `ticket_link`, `ticket_note`, `knowledge_write`, `ticket_github_refresh` | planning           |
+| `reviewer` (13 tools) | `ticket_review`, `ticket_note`, `ticket_github_refresh`                                                                          | verification       |
+| `full` (27 tools)     | All tools below, including project administration and `work_next`                                                                | all four           |
 
 Profiles are not an access-control boundary. They select tool exposure; every operation retains its OAuth scope and project-role checks. Resources remain independently authorized and available in every profile. Guides and prompts follow the selected profile; the tool surface works without either.
 
@@ -32,13 +32,21 @@ Profiles are not an access-control boundary. They select tool exposure; every op
 | Retrieval                  | `ticket_context`, `search`, `knowledge_get`, `knowledge_write`, `checkpoint_get`                                     |
 | Changes                    | `changes_since`                                                                                                      |
 
-`tickets_create` accepts 1–50 tickets atomically, defaulting to backlog. Use `ready` to queue execution. Each ticket needs 1–50 criteria. Priority 1 is highest; 5 is lowest. Work selection orders by priority, creation time, then identifier, and respects declared capabilities, labels, assignment, blockers, and active claims.
+`tickets_create` accepts 1–50 tickets atomically, defaulting to backlog. Use `ready` to queue execution. Each ticket needs 1–50 criteria. Priority 1 is highest; 5 is lowest. Default work selection orders by priority, creation time, then identifier, and respects declared capabilities, labels, assignment, blockers, and active claims.
 
 Ticket lifecycle: `backlog → ready → in_progress → in_review → done`, plus `cancelled` and reopening. `ticket_transition` prepares, cancels, or reopens; it cannot mark work done. Blocking links point from prerequisite (`source_id`) to dependent (`target_id`). Parent completion requires all children done or cancelled. A cancelled prerequisite still blocks its dependents until the link is removed or replaced. Parent and dependency relationships may not form a combined cycle.
 
 `work_claim` returns a token, expiry, compact ticket receipt, and brief context by default. `include_context:false` returns ownership alone. Heartbeat at least every three minutes; claims last ten minutes. Retrying an identical claim returns its original receipt and context snapshot, even after expiry; it never renews ownership. A new claim attempt needs a new key. Checkpoints return the new ticket revision so submission can chain without another read.
 
 Requirement edits revoke claims and invalidate affected reviews, completed dependent tickets, and parent approvals. Metadata edits still increment the ticket revision. Read current state after a revision conflict. Questions marked blocking prevent claims and submissions until an answer references their identifier. Checkpoints are immutable notes, and complete history can be paged with `ticket_history`.
+
+## Scheduling
+
+Projects can opt into `scheduling_policy:'unblocking'` on `project_create` or an administrator's revision-protected `project_update`. Setting the update field to `null` clears the override and restores `priority_age`; omitting it preserves the current setting. Unconfigured projects retain the original ordering. Project reads and summaries expose an explicitly configured policy. Built-in PostgreSQL and SQLite adapters support both policies; custom adapters without an advertised capability support only `priority_age`. Unsupported policy changes fail before committing, and restored unsupported policies fail automatic execution selection explicitly.
+
+The `unblocking` policy preserves strict priority first. Within one priority, tickets created at least 24 hours before the selection instant come first in creation-time/identifier order. Younger tickets follow, ordered by their number of unfinished direct dependents descending, then creation time and identifier. The count includes only same-project `blocks` links whose dependent is neither `done` nor `cancelled`. Each selection uses one fixed timestamp. Age is measured from `created_at`; edits and claim renewals do not reset it.
+
+This can favor prerequisites that help more work progress. The count estimates potential benefit: dependents may have other prerequisites or eligibility constraints. A waiting eligible ticket eventually joins the aged FIFO group, where younger arrivals cannot keep displacing it. The starvation guarantee applies within a priority to continuously eligible work, assuming older work continues progressing; strict priority can keep lower-priority work waiting. Status, assignment, required capabilities, requested labels, prerequisites, blocking questions, and live claims retain their existing gates. Explicit ticket claims and review ordering retain their existing behavior. Ranking uses bounded deterministic storage queries and no model calls.
 
 ## Completion policies
 
@@ -54,7 +62,7 @@ Context uses local `o200k_base` reference-token budgets: brief 4,096 (default), 
 
 Optional context prioritizes the latest checkpoint, unanswered nonblocking questions, latest review, and latest submission evidence, followed by bounded history at higher detail. Historical requirement snapshots remain in `ticket_history`. Each omission includes `retrieve_with` and executable `arguments`: fetch omitted checkpoints and latest rejection feedback marked `required_before:execution` before resumed work, and omitted submission evidence marked `required_before:review` before review. Checkpoint references identify an exact immutable checkpoint; `ticket_history` accepts `item_id` scoped to project, ticket, and kind. `ticket_get` returns current requirements/state without history. Context never invokes semantic search.
 
-For paged unanswered nonblocking questions, call `ticket_history` with `kind:'notes'` and `unanswered_questions:true`, without `item_id`. Results use creation-time/ID ascending order and support ordinary offset paging. Context omission references restart at offset zero because answering an already delivered question can shift the filtered positions; clients deduplicate questions by IDs already received. Ordinary history and exact-item retrieval retain their existing behavior.
+For paged unanswered nonblocking questions, call `ticket_history` with `kind:'notes'` and `nonblocking_unanswered:true`, without `item_id`. Results use creation-time/ID ascending order and support ordinary offset paging. Context omission references restart at offset zero because answering an already delivered question can shift the filtered positions; clients deduplicate questions by IDs already received. Ordinary history and exact-item retrieval retain their existing behavior.
 
 A client retaining full context may send its fingerprint as `if_none_match`. The server rebuilds and authorizes state before returning `{fingerprint,not_modified:true}`. Fingerprints cover permissions, requirements, project/dependency/history changes, effective lease expiration, detail, and budget. There is no server context cache or partial delta.
 
@@ -86,3 +94,15 @@ Mutation receipts retain identifiers, status, revisions, created note/submission
 | `changes_since` events  | 100                        | 25                            |
 | `ticket_context` detail | `standard`                 | `brief`                       |
 | Related knowledge       | Implicit search in context | Explicit `search` when needed |
+
+## GitHub evidence
+
+An operator may configure `TICKETING_GITHUB_REPOSITORY`, comma-separated `TICKETING_GITHUB_REQUIRED_CHECKS`, and numeric `TICKETING_GITHUB_CHECK_APP_ID`. `GITHUB_TOKEN` is an optional private credential for read-only API requests. There is no model-controlled repository URL or check-policy input.
+
+Planner/reviewer/full profiles expose `ticket_github_refresh`. Contributors/admins may link or change a PR using `pull_request_number`; verifiers may refresh an existing binding. Every refresh requires an idempotency key and records a protected immutable snapshot for the exact PR head, trusted app/check identities, conclusions, and `observed_at`. Missing, pending, failed, wrong-origin, or changed-head evidence never becomes a successful verification. Paginated evidence must be complete. Concurrent observations cannot overwrite newer known evidence; retry with reconciled state after a conflict.
+
+`ticket_get` and context expose recorded evidence when available; `ticket_history(kind:github)` retrieves immutable snapshots and supports exact `item_id`. Older snapshots or snapshots invalidated by requirements/head/policy changes are explicitly stale. Context omissions use existing history tools, including for workers; workers can use `ticket_note` to request a planner/reviewer refresh. Evidence is observed state, never continuously verified freshness. An idempotent retry returns the original receipt offline, even after newer snapshots exist. GitHub access does not post comments, merge PRs, complete tickets, or replace independent criterion review. Ordinary notes cannot supply trusted CI snapshot JSON.
+
+## Execution hints
+
+`project_create`, `project_update`, `tickets_create`, and `ticket_update` accept optional `execution_hints:{model,effort}`. Strings are trimmed and bounded to 128/32 characters; empty/null fields and empty/null objects clear the local override. Updates replace the local object; omitted objects remain unchanged. Current ticket details/context merge ticket fields over project defaults as `effective_execution_hints`, omitted when absent. Compact lists/receipts omit hints. These values are advisory and provider-neutral; the real consuming SDK must validate model and effort support. Hint changes update revisions/fingerprints without invalidating requirements or live claims.

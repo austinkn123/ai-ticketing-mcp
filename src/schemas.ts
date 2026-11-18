@@ -10,9 +10,25 @@ const labels = z.array(text.max(80)).max(30);
 const page = { limit: z.int().min(1).max(100).default(10), offset: z.int().min(0).max(1_000_000).default(0) };
 const maxTokens = z.int().min(512).max(32768);
 const criteria = z.array(text.max(1000)).min(1).max(50);
+const schedulingPolicy = z.enum(['priority_age', 'unblocking']);
+export const executionHintsSchema = z
+  .object({
+    model: z.string().trim().max(128).nullable().optional(),
+    effort: z.string().trim().max(32).nullable().optional(),
+  })
+  .strict()
+  .nullable()
+  .transform((value) => {
+    const hints = {
+      ...(value?.model ? { model: value.model } : {}),
+      ...(value?.effort ? { effort: value.effort } : {}),
+    };
+    return Object.keys(hints).length ? hints : null;
+  });
 const ticketFields = {
   title: text.max(300),
   description: text.max(16000),
+  execution_hints: executionHintsSchema.optional(),
   priority: z.int().min(1).max(5).default(3),
   labels: labels.default([]),
   capabilities: labels.default([]),
@@ -38,6 +54,8 @@ export const schemas = {
       name: text.max(200),
       instructions: z.string().max(16000).default(''),
       policy: z.enum(['self', 'independent', 'human']).default('independent'),
+      scheduling_policy: schedulingPolicy.optional(),
+      execution_hints: executionHintsSchema.optional(),
     })
     .strict(),
   project_update: z
@@ -48,6 +66,8 @@ export const schemas = {
       name: text.max(200).optional(),
       instructions: z.string().max(16000).optional(),
       policy: z.enum(['self', 'independent', 'human']).optional(),
+      scheduling_policy: schedulingPolicy.nullable().optional(),
+      execution_hints: executionHintsSchema.optional(),
     })
     .strict(),
   member_set: z
@@ -75,14 +95,14 @@ export const schemas = {
     .object({
       ...ticket,
       ...page,
-      kind: z.enum(['notes', 'submissions', 'reviews']).default('notes'),
+      kind: z.enum(['notes', 'submissions', 'reviews', 'github']).default('notes'),
       item_id: id.optional(),
-      unanswered_questions: z.literal(true).optional(),
+      nonblocking_unanswered: z.literal(true).optional(),
     })
     .strict()
-    .refine((input) => !input.unanswered_questions || (input.kind === 'notes' && !input.item_id), {
-      message: 'unanswered_questions requires notes history and cannot be combined with item_id.',
-      path: ['unanswered_questions'],
+    .refine((input) => !input.nonblocking_unanswered || (input.kind === 'notes' && !input.item_id), {
+      message: 'nonblocking_unanswered requires notes history and cannot be combined with item_id.',
+      path: ['nonblocking_unanswered'],
     }),
   ticket_list: z
     .object({
@@ -99,6 +119,7 @@ export const schemas = {
       ...revision,
       title: ticketFields.title.optional(),
       description: ticketFields.description.optional(),
+      execution_hints: executionHintsSchema.optional(),
       priority: z.int().min(1).max(5).optional(),
       labels: labels.optional(),
       capabilities: labels.optional(),
@@ -115,6 +136,9 @@ export const schemas = {
       status: z.enum(['backlog', 'ready', 'cancelled']),
       reason: text.max(2000),
     })
+    .strict(),
+  ticket_github_refresh: z
+    .object({ ...ticket, ...mutation, pull_request_number: z.int().min(1).max(2147483647).optional() })
     .strict(),
   ticket_link: z
     .object({
@@ -245,6 +269,8 @@ export const readOperations = new Set<Operation>([
   'changes_since',
 ]);
 export const descriptions: Record<Operation, string> = {
+  ticket_github_refresh:
+    'Link or refresh a PR in the configured trusted repository; retrieve immutable evidence for its exact head SHA. Never approves or merges work.',
   project_list: 'List projects accessible to your authenticated identity.',
   project_get: 'Read project instructions, review policy, and member identities.',
   project_create: 'Create a project. Requires system administrator access.',
@@ -253,8 +279,9 @@ export const descriptions: Record<Operation, string> = {
   tickets_create:
     'Atomically create up to 50 tickets with acceptance criteria. Use status ready to make work claimable.',
   ticket_get:
-    'Read a ticket, all criteria, dependencies, recent notes, and submissions. Accepts UUID or project ticket key.',
-  ticket_history: 'Page through the complete notes, submissions, or reviews for a ticket.',
+    'Read current ticket details, criteria, dependencies, claim, and blockers. Accepts UUID or ticket key. Use ticket_history for historical records.',
+  ticket_history:
+    'Page through complete notes, submissions, reviews, or GitHub evidence history for a ticket.',
   ticket_list: 'List project tickets, optionally filtered by status.',
   ticket_update:
     'Edit a ticket with revision protection. Requirement changes revoke claims and invalidate affected approvals.',

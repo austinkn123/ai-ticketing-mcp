@@ -12,14 +12,46 @@ import {
   type Tables,
   type Query,
   type Job,
+  type OutboundDelivery,
+  type DeliveryOutcome,
   type SearchAdapter,
   type SearchDocument,
   type SearchHit,
   type EmbeddingProfile,
   type Note,
+  type SchedulingPolicy,
 } from '../contracts.js';
 
 const columns: Record<Table, string[]> = {
+  outbound_deliveries: [
+    'id',
+    'event_id',
+    'project_id',
+    'body',
+    'target_fingerprint',
+    'attempt_count',
+    'next_attempt_at',
+    'locked_until',
+    'lock_token',
+    'sent_at',
+    'last_error',
+    'created_at',
+  ],
+  github_evidence: [
+    'id',
+    'project_id',
+    'ticket_id',
+    'actor_id',
+    'repository',
+    'pull_request_number',
+    'head_sha',
+    'observed_head_sha',
+    'status',
+    'requirements_revision',
+    'ticket_revision',
+    'checks',
+    'observed_at',
+  ],
   actors: ['id', 'issuer', 'subject', 'name', 'kind', 'system_admin'],
   projects: [
     'id',
@@ -27,10 +59,12 @@ const columns: Record<Table, string[]> = {
     'name',
     'instructions',
     'policy',
+    'execution_hints',
     'revision',
     'ticket_seq',
     'event_seq',
     'created_at',
+    'scheduling_policy',
   ],
   members: ['id', 'project_id', 'actor_id', 'role'],
   tickets: [
@@ -39,6 +73,8 @@ const columns: Record<Table, string[]> = {
     'key',
     'title',
     'description',
+    'execution_hints',
+    'github_pull_request',
     'status',
     'priority',
     'labels',
@@ -107,18 +143,32 @@ const columns: Record<Table, string[]> = {
     'last_error',
   ],
 };
-const jsonColumns = new Set(['metadata', 'evidence', 'data', 'result', 'requirements_snapshot']);
+const jsonColumns = new Set([
+  'metadata',
+  'evidence',
+  'data',
+  'result',
+  'requirements_snapshot',
+  'execution_hints',
+  'github_pull_request',
+  'checks',
+]);
 type Executor = Pick<pg.Pool, 'query'> | Pick<pg.PoolClient, 'query'>;
 function decode(row: Record<string, unknown>) {
   return Object.fromEntries(
-    Object.entries(row).map(([key, value]) => [
-      key,
-      value instanceof Date
-        ? value.toISOString()
-        : key === 'seq' || key === 'event_seq'
-          ? Number(value)
-          : value,
-    ]),
+    Object.entries(row)
+      .filter(
+        ([key, value]) =>
+          !['execution_hints', 'github_pull_request', 'scheduling_policy'].includes(key) || value !== null,
+      )
+      .map(([key, value]) => [
+        key,
+        value instanceof Date
+          ? value.toISOString()
+          : key === 'seq' || key === 'event_seq'
+            ? Number(value)
+            : value,
+      ]),
   );
 }
 function translate(error: unknown): never {
@@ -146,9 +196,32 @@ function repository(db: Executor): Transaction {
       );
       return result.rows.map(decode) as unknown as Note[];
     },
-    async workCandidates(projectId, actorId, capabilities, labels, now, limit, offset) {
+    async workCandidates(
+      projectId,
+      actorId,
+      capabilities,
+      labels,
+      now,
+      limit,
+      offset,
+      policy = 'priority_age',
+    ) {
+      ensure(
+        Number.isSafeInteger(limit) &&
+          limit >= 1 &&
+          limit <= 10001 &&
+          Number.isSafeInteger(offset) &&
+          offset >= 0,
+        'INVALID_QUERY',
+        'Work page limit must be 1–10001 and offset must be nonnegative.',
+      );
+      ensure(['priority_age', 'unblocking'].includes(policy), 'INVALID_QUERY', 'Unknown scheduling policy.');
+      const order =
+        policy === 'unblocking'
+          ? `t.priority,CASE WHEN t.created_at<=($5::timestamptz-interval '24 hours') THEN 0 ELSE 1 END,CASE WHEN t.created_at<=($5::timestamptz-interval '24 hours') THEN 0 ELSE (SELECT count(*) FROM links outgoing JOIN tickets dependent ON dependent.id=outgoing.target_id AND dependent.project_id=t.project_id WHERE outgoing.project_id=t.project_id AND outgoing.source_id=t.id AND outgoing.kind='blocks' AND dependent.status NOT IN ('done','cancelled')) END DESC,t.created_at,t.id`
+          : 't.priority,t.created_at,t.id';
       const result = await db.query(
-        `SELECT t.* FROM tickets t WHERE t.project_id=$1 AND t.status IN ('ready','in_progress') AND (t.assignee_id IS NULL OR t.assignee_id=$2) AND t.capabilities <@ $3::text[] AND t.labels @> $4::text[] AND NOT EXISTS(SELECT 1 FROM claims c WHERE c.ticket_id=t.id AND c.expires_at>$5) AND NOT EXISTS(SELECT 1 FROM links l JOIN tickets prerequisite ON prerequisite.id=l.source_id WHERE l.target_id=t.id AND l.kind='blocks' AND prerequisite.status<>'done') AND NOT EXISTS(SELECT 1 FROM notes q WHERE q.ticket_id=t.id AND q.kind='question' AND q.blocking AND NOT EXISTS(SELECT 1 FROM notes a WHERE a.answer_to=q.id AND a.kind='answer')) ORDER BY t.priority,t.created_at,t.id LIMIT $6 OFFSET $7`,
+        `SELECT t.* FROM tickets t WHERE t.project_id=$1 AND t.status IN ('ready','in_progress') AND (t.assignee_id IS NULL OR t.assignee_id=$2) AND t.capabilities <@ $3::text[] AND t.labels @> $4::text[] AND NOT EXISTS(SELECT 1 FROM claims c WHERE c.ticket_id=t.id AND c.expires_at>$5) AND NOT EXISTS(SELECT 1 FROM links l JOIN tickets prerequisite ON prerequisite.id=l.source_id WHERE l.target_id=t.id AND l.kind='blocks' AND prerequisite.status<>'done') AND NOT EXISTS(SELECT 1 FROM notes q WHERE q.ticket_id=t.id AND q.kind='question' AND q.blocking AND NOT EXISTS(SELECT 1 FROM notes a WHERE a.answer_to=q.id AND a.kind='answer')) ORDER BY ${order} LIMIT $6 OFFSET $7`,
         [projectId, actorId, capabilities, labels, now, limit, offset],
       );
       return result.rows.map(decode) as unknown as Tables['tickets'][];
@@ -203,22 +276,29 @@ function repository(db: Executor): Transaction {
       const record = value as unknown as Record<string, unknown>;
       const values = keys.map((key) => (jsonColumns.has(key) ? JSON.stringify(record[key]) : record[key]));
       const names = keys.map((key) => field(table, key));
+      const conflict =
+        table === 'github_evidence' || table === 'outbound_deliveries'
+          ? ''
+          : ` ON CONFLICT(id) DO UPDATE SET ${names
+              .filter((name) => name !== '"id"')
+              .map((name) => `${name}=EXCLUDED.${name}`)
+              .join(',')}`;
       await db.query(
-        `INSERT INTO "${table}" (${names.join(',')}) VALUES (${keys.map((_, i) => `$${i + 1}`).join(',')}) ON CONFLICT(id) DO UPDATE SET ${names
-          .filter((name) => name !== '"id"')
-          .map((name) => `${name}=EXCLUDED.${name}`)
-          .join(',')}`,
+        `INSERT INTO "${table}" (${names.join(',')}) VALUES (${keys.map((_, i) => `$${i + 1}`).join(',')})${conflict}`,
         values,
       );
     },
     async remove(table, id) {
       ensure(Object.hasOwn(columns, table), 'INVALID_QUERY', 'Unknown storage table.');
+      ensure(table !== 'github_evidence', 'IMMUTABLE_EVIDENCE', 'GitHub evidence snapshots are immutable.');
+      ensure(table !== 'outbound_deliveries', 'IMMUTABLE_DELIVERY', 'Outbound deliveries are immutable.');
       await db.query(`DELETE FROM "${table}" WHERE id=$1`, [id]);
     },
   };
 }
 
 export class PostgresStorage implements StorageAdapter {
+  readonly schedulingPolicies = Object.freeze(['priority_age', 'unblocking'] as const);
   readonly pool: pg.Pool;
   private reader: Transaction;
   constructor(connectionString: string) {
@@ -247,8 +327,9 @@ export class PostgresStorage implements StorageAdapter {
     now: string,
     limit: number,
     offset: number,
+    policy: SchedulingPolicy = 'priority_age',
   ) {
-    return this.reader.workCandidates(projectId, actorId, capabilities, labels, now, limit, offset);
+    return this.reader.workCandidates(projectId, actorId, capabilities, labels, now, limit, offset, policy);
   }
   async transaction<T>(scope: string, work: (tx: Transaction) => Promise<T>) {
     const client = await this.pool.connect();
@@ -335,6 +416,52 @@ export class PostgresStorage implements StorageAdapter {
   }
   async health() {
     await this.pool.query('SELECT 1 FROM schema_migrations LIMIT 1');
+  }
+  async leaseDeliveries(
+    targetFingerprint: string,
+    limit: number,
+    leaseMs: number,
+  ): Promise<OutboundDelivery[]> {
+    ensure(
+      Number.isInteger(limit) && limit >= 1 && limit <= 100,
+      'INVALID_INPUT',
+      'Delivery batch must be 1–100.',
+    );
+    ensure(
+      Number.isInteger(leaseMs) && leaseMs >= 1 && leaseMs <= 3600000,
+      'INVALID_INPUT',
+      'Invalid delivery lease.',
+    );
+    const result = await this.pool.query(
+      `UPDATE outbound_deliveries SET locked_until=now()+($3 * interval '1 millisecond'), lock_token=gen_random_uuid(), attempt_count=least(attempt_count::bigint+1,2147483647)::integer WHERE id IN (SELECT id FROM outbound_deliveries WHERE target_fingerprint=$1 AND sent_at IS NULL AND next_attempt_at<=now() AND (locked_until IS NULL OR locked_until<=now()) ORDER BY next_attempt_at,id FOR UPDATE SKIP LOCKED LIMIT $2) RETURNING *`,
+      [targetFingerprint, limit, leaseMs],
+    );
+    return result.rows.map(decode) as unknown as OutboundDelivery[];
+  }
+  async finishDelivery(delivery: OutboundDelivery, outcome: DeliveryOutcome): Promise<void> {
+    if (!delivery.lock_token) return;
+    if ('sent_at' in outcome) {
+      await this.pool.query(
+        'UPDATE outbound_deliveries SET sent_at=$3,locked_until=NULL,lock_token=NULL,last_error=NULL WHERE id=$1 AND lock_token=$2 AND sent_at IS NULL',
+        [delivery.id, delivery.lock_token, outcome.sent_at],
+      );
+    } else {
+      ensure(
+        /^[A-Z][A-Z0-9_]{0,79}$/.test(outcome.error_code),
+        'INVALID_INPUT',
+        'Delivery errors must be safe codes.',
+      );
+      await this.pool.query(
+        'UPDATE outbound_deliveries SET next_attempt_at=$3,last_error=$4,locked_until=NULL,lock_token=NULL WHERE id=$1 AND lock_token=$2 AND sent_at IS NULL',
+        [delivery.id, delivery.lock_token, outcome.next_attempt_at, outcome.error_code],
+      );
+    }
+  }
+  async deliveryMetrics() {
+    const result = await this.pool.query(
+      `SELECT count(*) FILTER(WHERE sent_at IS NULL)::float webhook_pending,count(*) FILTER(WHERE sent_at IS NULL AND last_error IS NOT NULL)::float webhook_failed,least(coalesce(sum(attempt_count),0),9007199254740991)::float webhook_attempts FROM outbound_deliveries`,
+    );
+    return result.rows[0] as { webhook_pending: number; webhook_failed: number; webhook_attempts: number };
   }
   async metrics() {
     const result = await this.pool.query(
@@ -488,15 +615,17 @@ export class PostgresSearch implements SearchAdapter {
       });
     return [...merged.values()].sort((a, b) => b.score - a.score || a.id.localeCompare(b.id)).slice(0, limit);
   }
-  async coverage(projectId: string, profile: EmbeddingProfile) {
+  async coverage(projectId: string, profile?: EmbeddingProfile) {
     // shortcut: coverage is a five-second snapshot; use durable counters if exact live counts become necessary.
-    const key = `${projectId}:${profile.id}`;
+    const key = `${projectId}:${profile?.id ?? 'lexical'}`;
     const cached = this.coverageCache.get(key);
     if (cached && cached.expires > Date.now()) return cached.value;
     const value = this.pool
       .query(
-        `SELECT count(*)::integer documents,count(v.document_id)::integer embedded FROM search_documents d LEFT JOIN search_vectors v ON v.document_id=d.id AND v.revision=d.revision AND v.profile_id=$2 WHERE d.project_id=$1 AND NOT d.archived`,
-        [projectId, profile.id],
+        profile
+          ? `SELECT count(*)::integer documents,count(v.document_id)::integer embedded FROM search_documents d LEFT JOIN search_vectors v ON v.document_id=d.id AND v.revision=d.revision AND v.profile_id=$2 WHERE d.project_id=$1 AND NOT d.archived`
+          : 'SELECT count(*)::integer documents,0::integer embedded FROM search_documents WHERE project_id=$1 AND NOT archived',
+        profile ? [projectId, profile.id] : [projectId],
       )
       .then((result) => ({ ...result.rows[0], observed_at: new Date().toISOString() }))
       .catch((error) => {

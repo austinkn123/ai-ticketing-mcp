@@ -11,6 +11,7 @@ import {
   type Project,
   type Ticket,
   type Policy,
+  type GitHubEvidence,
 } from '../contracts.js';
 
 export const testEmbeddings: EmbeddingProvider = {
@@ -223,6 +224,62 @@ export function registerAdapterContractTests(name: string, factory: () => Promis
       assert.equal(context.claim.actor_id, winner.value.claim.actor_id);
       assert.equal(context.claim.token, undefined);
     });
+    check(
+      'persists advisory execution hints with per-field inheritance and clears local overrides',
+      async (f) => {
+        const defaults = (await f.call(f.admin.id, 'project_update', {
+          expected_revision: f.project.revision,
+          execution_hints: { model: ' future/model ', effort: ' xhigh ' },
+        })) as any;
+        assert.equal(defaults.execution_hints, undefined);
+        const ticket = await f.ticket({ execution_hints: { effort: ' high ' } });
+        const first = await f.read(ticket.id);
+        assert.deepEqual(first.effective_execution_hints, { model: 'future/model', effort: 'high' });
+        const input = { project_id: f.project.id, ticket_id: ticket.id, idempotency_key: randomUUID() };
+        const claimed = (await f.app.execute(f.worker.id, 'work_claim', input)) as any;
+        assert.deepEqual(claimed.context.effective_execution_hints, first.effective_execution_hints);
+        const updated = (await f.call(f.worker.id, 'ticket_update', {
+          ticket_id: ticket.id,
+          expected_revision: claimed.ticket.revision,
+          execution_hints: { model: 'custom/model' },
+        })) as any;
+        assert.equal(updated.requirements_revision, ticket.requirements_revision);
+        assert.equal(updated.execution_hints, undefined);
+        assert.equal((await f.storage.get('claims', ticket.id))?.token, claimed.claim.token);
+        assert.deepEqual((await f.read(ticket.id)).effective_execution_hints, {
+          model: 'custom/model',
+          effort: 'xhigh',
+        });
+        assert.deepEqual(await f.app.execute(f.worker.id, 'work_claim', input), claimed);
+        const cleared = (await f.call(f.worker.id, 'ticket_update', {
+          ticket_id: ticket.id,
+          expected_revision: updated.revision,
+          execution_hints: null,
+        })) as any;
+        assert.deepEqual((await f.read(ticket.id)).effective_execution_hints, {
+          model: 'future/model',
+          effort: 'xhigh',
+        });
+        const before = (await f.app.execute(f.worker.id, 'ticket_context', {
+          project_id: f.project.id,
+          ticket_id: ticket.id,
+        })) as any;
+        await f.call(f.admin.id, 'project_update', {
+          expected_revision: defaults.revision,
+          execution_hints: {},
+        });
+        const after = (await f.app.execute(f.worker.id, 'ticket_context', {
+          project_id: f.project.id,
+          ticket_id: ticket.id,
+          if_none_match: before.fingerprint,
+        })) as any;
+        assert.equal(after.not_modified, false);
+        assert.equal(after.effective_execution_hints, undefined);
+        assert.equal((await f.read(ticket.id)).ticket.revision, cleared.revision);
+        const list = (await f.app.execute(f.worker.id, 'ticket_list', { project_id: f.project.id })) as any;
+        assert.equal(list.tickets[0].execution_hints, undefined);
+      },
+    );
     check('atomically distributes next work to concurrent agents', async (f) => {
       for (let i = 0; i < 16; i++) await f.ticket();
       const claims = await Promise.all(Array.from({ length: 16 }, () => f.claim()));
@@ -292,7 +349,8 @@ export function registerAdapterContractTests(name: string, factory: () => Promis
       const ticket = await f.ticket();
       const source = (await f.app.sourceDocument(f.storage, 'ticket', ticket.id))!;
       await f.search.indexText(source);
-      await f.search.indexVector(source, testEmbeddings.profile, [1, 1, 0.2]);
+      if (f.search.capabilities?.semantic !== false)
+        await f.search.indexVector(source, testEmbeddings.profile, [1, 1, 0.2]);
       assert.ok((await f.search.search(f.project.id, 'database', 10)).some((hit) => hit.id === ticket.id));
       await f.search.indexText({ ...source, revision: source.revision + 1, archived: true });
       await f.search.indexText(source);
@@ -304,12 +362,53 @@ export function registerAdapterContractTests(name: string, factory: () => Promis
       assert.equal((await f.search.coverage(f.project.id, testEmbeddings.profile)).documents, 0);
       await f.search.indexText(source);
       assert.equal((await f.search.coverage(f.project.id, testEmbeddings.profile)).documents, 1);
-      await f.search.indexVector(source, testEmbeddings.profile, [1, 1, 0.2]);
+      if (f.search.capabilities?.semantic !== false)
+        await f.search.indexVector(source, testEmbeddings.profile, [1, 1, 0.2]);
       const complete = await f.search.coverage(f.project.id, testEmbeddings.profile);
-      assert.equal(complete.embedded, 1);
+      assert.equal(complete.embedded, f.search.capabilities?.semantic === false ? 0 : 1);
       assert.ok(Date.parse(complete.observed_at));
       await f.search.indexText({ ...source, revision: source.revision + 1, archived: true });
       assert.equal((await f.search.coverage(f.project.id, testEmbeddings.profile)).documents, 0);
+    });
+    check('retains immutable GitHub evidence and its exact SHA/check metadata', async (f) => {
+      const ticket = await f.ticket();
+      const row: GitHubEvidence = {
+        id: randomUUID(),
+        project_id: f.project.id,
+        ticket_id: ticket.id,
+        actor_id: f.worker.id,
+        repository: 'example/repository',
+        pull_request_number: 1,
+        head_sha: 'a'.repeat(40),
+        observed_head_sha: 'a'.repeat(40),
+        status: 'passed',
+        requirements_revision: 1,
+        ticket_revision: 1,
+        checks: [
+          {
+            name: 'verify',
+            required_app_id: 15368,
+            run_id: 1,
+            app_id: 15368,
+            head_sha: 'a'.repeat(40),
+            status: 'completed',
+            conclusion: 'success',
+            url: 'https://github.com/example/repository/actions/runs/1',
+          },
+        ],
+        observed_at: f.clock.now.toISOString(),
+      };
+      await f.storage.transaction(f.project.id, (tx) => tx.put('github_evidence', row));
+      assert.deepEqual(await f.storage.readSnapshot((reader) => reader.get('github_evidence', row.id)), row);
+      await assert.rejects(
+        f.storage.transaction(f.project.id, (tx) => tx.put('github_evidence', { ...row, status: 'failed' })),
+        hasCode('CONFLICT'),
+      );
+      await assert.rejects(
+        f.storage.transaction(f.project.id, (tx) => tx.remove('github_evidence', row.id)),
+        hasCode('IMMUTABLE_EVIDENCE'),
+      );
+      assert.deepEqual(await f.storage.get('github_evidence', row.id), row);
     });
     check('leases each indexing job once and fences stale job completions', async (f) => {
       const ticket = await f.ticket();

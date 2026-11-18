@@ -1,6 +1,6 @@
 {
   "name": "ai-ticketing-mcp",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "description": "Headless AI work coordination through MCP, with replaceable storage and semantic search.",
   "type": "module",
   "license": "Apache-2.0",
@@ -14,7 +14,8 @@
     ".": "./dist/index.js",
     "./contracts": "./dist/contracts.js",
     "./testing": "./dist/testing/contracts.js",
-    "./postgres": "./dist/adapters/postgres.js"
+    "./postgres": "./dist/adapters/postgres.js",
+    "./sqlite": "./dist/adapters/sqlite.js"
   },
   "files": [
     "dist",
@@ -34,6 +35,8 @@
     "commit:check": "node scripts/check-commits.mjs",
     "benchmark": "tsx scripts/benchmark.ts",
     "benchmark:protocol": "tsx scripts/protocol-benchmark.ts",
+    "benchmark:claims": "tsx scripts/claim-benchmark.ts",
+    "profile:report": "tsx src/cli.ts profile-report",
     "walkthrough": "tsx scripts/walkthrough.ts",
     "format": "prettier --write .",
     "format:check": "prettier --check .",

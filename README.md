@@ -8,12 +8,15 @@ Headless ticketing built for agents: find useful work, claim it safely, recover 
 
 - Structured tickets with acceptance criteria, priorities, capabilities, parents, and blocking dependencies.
 - Atomic ten-minute claims, heartbeat renewal, stale-worker fencing, and retry-safe mutations.
+- Optional [GitHub CI evidence](docs/mcp.md#github-evidence), [durable signed notifications](docs/operations.md#durable-signed-notifications), and [deterministic unblocking scheduling](docs/mcp.md#scheduling).
 - Durable checkpoints, blocking questions, decisions, and artifact references.
 - One-call context with complete requirements, project instructions, prior work, and explicit retrieval references.
 - Self, independent-agent, or human verification policies. Independent review is the default.
 - Hybrid text/vector search, using local Ollama or a hosted OpenAI-compatible embedding provider.
 - Attributable events and durable polling cursors, without keeping an MCP connection alive.
 - Local stdio and OAuth-protected Streamable HTTP; no frontend or agent runtime required.
+
+For automatic server-side traffic capture and offline token reports, see [MCP profiling](docs/operations.md#mcp-profiling). It adds no tools or response fields to the agent's context.
 
 ## Quickstart
 
@@ -57,6 +60,22 @@ Connect with `stdio --profile planner` or `/mcp?profile=reviewer`; OAuth tokens 
 
 Ticket references accept a UUID or readable key such as `CORE-42`. Project references use UUIDs. Full [tool and workflow behavior](docs/mcp.md) is documented separately.
 
+## Local SQLite
+
+After `npm ci` and `npm run build`, start a local MCP server without PostgreSQL or an embedding service:
+
+```sh
+node dist/cli.js stdio --sqlite .local/ticketing.sqlite --profile full
+```
+
+Use an absolute file path in MCP client configuration. The server migrates the file and, when no explicit actor is supplied, persists a local agent identity with administrator access. This trusts the local file owner, never impersonates a human reviewer, and does not bootstrap HTTP authentication. Explicit `ACTOR_ID` or `--actor` takes precedence. SQLite stdio indexes its durable queue in the background, so newly created tickets become searchable without another worker. PostgreSQL and HTTP still use the existing worker command.
+
+For other CLI commands, set `STORAGE_ADAPTER=sqlite`, `SQLITE_PATH`, and `EMBEDDING_PROVIDER=none`, or use `--sqlite PATH`. PostgreSQL remains the default. SQLite provides full-text search and reports semantic search as disabled.
+
+## Advisory execution hints
+
+Projects and tickets accept optional `execution_hints` with `model` and `effort` strings. Ticket fields override the corresponding project defaults; `ticket_get` and context expose `effective_execution_hints` only when configured. A provided object replaces the local hints; an omitted object leaves them unchanged. Null, an empty object, or empty/null fields clear local choices so project defaults can apply. Model/effort hints never execute a provider, configure embeddings, grant permissions, or guarantee a model is accepted by the consuming client.
+
 ## Extending the system
 
 ```ts
@@ -82,11 +101,15 @@ npm run check
 npm run format:check
 # With a disposable database configured, check the frozen protocol benchmark.
 npm run benchmark:protocol
+# Measure concurrent claims/heartbeats and receipt capacity on PostgreSQL.
+npm run benchmark:claims
 ```
 
-Integration tests require a real database and fail clearly when it is not configured. They exercise claims, races, retries, stale workers, review policies, permissions, search freshness, and both MCP transports. See the [verification record](docs/verification.md) for measured results and [operations](docs/operations.md) for backup/restore, rebuilding search, and benchmarks.
+Integration tests require a real database and fail clearly when it is not configured. They exercise claims, races, retries, stale workers, review policies, permissions, search freshness, and both MCP transports. See the [verification record](docs/verification.md) for measured results, the [real-client benchmark](docs/real-client-benchmark.md) for Codex cost/completion measurements, and [operations](docs/operations.md) for backup/restore, rebuilding search, and benchmarks.
 
 Contributions use [Conventional Commits](CONTRIBUTING.md). Public MCP and adapter contracts follow semantic versioning. Licensed under [Apache-2.0](LICENSE).
+
+Before upgrading, read the [release notes and required migrations](docs/release-notes.md).
 
 ## Boundaries
 

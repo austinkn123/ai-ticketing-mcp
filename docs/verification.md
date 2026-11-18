@@ -1,5 +1,36 @@
 # Verification record
 
+## PR #1 optional cleanup in PR #2: 2026-11-18
+
+The remaining query-cache and naming nits are implemented. Query caches use exact text keys within each immutable profile instance and reclaim expired completed entries before live completed LRU entries at capacity. A new regression test first failed on the previous eviction behavior, then passed after the fix; it also verifies that pending work stays coalesced. Existing TTL, capacity, failure-retry, result-isolation, and separate-profile checks still pass.
+
+The history filter and generated omission arguments now use `nonblocking_unanswered`, with no alias for `unanswered_questions`. Schema tests reject the old field and invalid combinations; PostgreSQL and SQLite tests verify the filtered behavior. Package, MCP server, and CLI metadata advance to 2.0.0, with the breaking input change recorded in the release notes.
+
+Local Node 24 validation passed 163 tests (111 unit/SQLite and 52 PostgreSQL), both benchmarks, type checking, build, formatting, and credential scanning. The frozen protocol baseline and workload fixtures were unchanged. Claim packing and receipt retention retain the operating limits measured below.
+
+## PR #2 review follow-up: 2026-11-18
+
+`npm run benchmark:claims` was run against a new disposable PostgreSQL 17.12 database on the local Docker host, using Node 24.22.3 on Windows (32 available logical CPUs, 31.14 GiB host RAM). Application/database resources were not constrained to the earlier 4-vCPU/8-GB target. This measurement used the PR #2 worktree based on `10da326`, with the new benchmark; CI attaches a fresh report to each tested commit.
+
+Each case used three bursts of eight simultaneous claims and eight heartbeats in one project: 24 samples per operation, 96 measured claims and 96 heartbeats overall. Fixtures, pool/tokenizer warmup, replay checks, and assertions were outside the measured intervals. These are application calls with real PostgreSQL I/O, excluding MCP/HTTP transport and embedding inference. The large fixture uses 50 criteria containing deterministic SHA-256 strings to exercise high-entropy context and storage; it is not a representative compression ratio for ordinary prose.
+
+| Case                            | Claim p95 | Heartbeat p95 | Median response tokens | Mean logical receipt result | Mean stored receipt result |
+| ------------------------------- | --------: | ------------: | ---------------------: | --------------------------: | -------------------------: |
+| Claim only, modest requirements |  141.9 ms |      149.2 ms |                    258 |                       542 B |                      585 B |
+| Embedded brief context          |  202.2 ms |      185.2 ms |                  1,502 |                     6,560 B |                    1,589 B |
+| Claim only, large requirements  |  142.9 ms |      135.9 ms |                    254 |                       542 B |                      585 B |
+| Embedded large context          |  377.8 ms |      335.9 ms |                 24,203 |                    47,945 B |                   48,881 B |
+
+The embedded-large case **missed the ordinary 300 ms p95 target** for both operations. All calls succeeded; assertions checked response budgets, persisted live ownership, lease extension, identical receipt replay, and no extra receipts on retry. Latencies include query/pool/lock waits and packing, not isolated lock-hold measurements. This small single-process burst test does not establish sustained-load capacity or SQLite performance. It supports retaining atomic claims while documenting the cost and the existing claim-only option, not claiming that contention is eliminated.
+
+At an illustrative 10,000 claims/day for 365 days, the stored result data alone projects to 1.99 GiB for claim-only receipts, 5.40 GiB for this repetitive brief fixture, and 166.16 GiB for the high-entropy large fixture. These estimates exclude row/index overhead, non-claim receipts, WAL, backups, and replicas. Receipt retention remains indefinite; the [capacity procedure and thresholds](operations.md#claim-contention-and-receipt-capacity) require measuring the actual content mix and daily table/disk growth. No deletion or post-commit packing change was introduced.
+
+The [release notes](release-notes.md) now collect required custom-adapter methods, MCP behavior changes, embedding reindex requirements, and pending migrations, including changes already merged in PR #1.
+
+Local validation also passed all 162 existing tests (110 unit/SQLite and 52 PostgreSQL), the frozen protocol benchmark, application and benchmark TypeScript checks, production build, formatting, and credential scanning. Published CI status must be checked for the final PR head rather than inferred from an earlier review or this local run.
+
+## Original functional verification: 2026-11-16
+
 Verified on 2026-11-16. The application was built and exercised against real PostgreSQL with pgvector, the official MCP SDK clients, Keycloak, and local Ollama.
 
 ## Functional checks
@@ -33,7 +64,7 @@ The tests exposed and fixed a PostgreSQL shared-memory limit, an inefficient que
 
 ## Checks requiring operator infrastructure
 
-Hosted embeddings were verified against an OpenAI-compatible HTTP fixture, without spending against a live hosted API account. Public HTTPS/domain routing and an interactive human login were not exercised; the included local Keycloak server and signed-token authentication were exercised. PostgreSQL is the only supported production storage adapter; replacement adapters must run the exported contract tests.
+Hosted embeddings were verified against an OpenAI-compatible HTTP fixture, without spending against a live hosted API account. Public HTTPS/domain routing and an interactive human login were not exercised; the included local Keycloak server and signed-token authentication were exercised. PostgreSQL remains the production deployment adapter. SQLite now supports local operation with the same contract suite; its performance was not measured by the historical load test above. Replacement adapters must run the exported contract tests.
 
 ## Token-efficiency verification: 2026-11-17
 
@@ -69,3 +100,37 @@ The token-efficiency figures above record the pre-review implementation at `540e
 With Node 24.22.3, all 16 focused maintenance/excerpt tests passed. They cover paginated change catch-up, later-page terminal events, missing event metadata, retry cursors, nonadvancing-page backoff, independent heartbeats during a pending catch-up request, and cancellation during each pending request. Excerpt checks cover bounded Unicode windows, preserved query matches, ordinary special-token strings, an exact 200-token limit, and at most 20 encoder calls on an adversarial prefix.
 
 A database-free comparison against that pre-review source used 50,000 DNA emoji before the query and 2,000 test-tube emoji after it. Encoder calls fell from 90 to 18; both results retained the query, remained well-formed Unicode, and contained 199 reference tokens. This focused operation-count check does not establish database or production latency performance.
+
+## Real MCP client measurement: 2026-11-18 UTC
+
+The [installed-client harness](real-client-benchmark.md) exercised all six frozen workflows with Codex CLI `0.169.0-alpha.11.1`, requesting `gpt-6.1-sol` for workers and `gpt-6-astra` for independent review, both at `xhigh`. The measured application runtime was pinned to `e9f3ec7387628299e966ad81420d9f9e6d800ad4`; this is not a measurement of later GitHub, notification, or scheduling changes. Eight actual client invocations include one failed short-workflow attempt and its retry.
+
+| Main-client reported usage           |    Tokens |
+| ------------------------------------ | --------: |
+| Input                                | 2,320,013 |
+| Cached input, included in input      | 2,025,728 |
+| Output                               |    12,983 |
+| Reasoning output, included in output |     3,300 |
+
+These totals include reported usage from failed attempts. The eight client invocations took 560.232 seconds in aggregate, with individual durations from 51.385 to 114.670 seconds; this includes client/model time and is separate from database latency. Monetary cost, internal provider retries, and additional automatic approval-review usage remain unknown. These measurements do not establish billed savings against the reference baseline.
+
+The immutable original report classified three workflows complete and four attempts failed. Three verdicts were validator defects: comparison against an unnormalized fixture description, discarded prior checkpoint-delivery proof, and target facts overwritten by a prerequisite read. Regression-tested corrections revalidated captured responses and authoritative fixture state offline, yielding six completed workflows without new provider calls. The initial short attempt remains failed. Original failures, usage, transcripts, and reports were retained; the correction is a separate append-only artifact.
+
+The original report SHA-256 is `0173a70afca4d936de5346fb5a41346941d2b5940cf248b98cef2d0b9477b2c0`. Validation checks role-specific responses and required facts acknowledged before dependent mutations; fixture setup and off-model maintenance cannot establish model delivery. Private artifacts remain ignored because raw MCP transcripts contain synthetic claim credentials. The harness and revalidator are committed at `66d4119` with seventeen focused parser and revalidation tests. Client logs do not expose the exact final model rendering, so observed responses and action acknowledgments remain evidence of coordination behavior, not proof of complete model comprehension.
+
+## Self-hosted roadmap verification: 2026-11-18 UTC
+
+[CI run 44223407288](https://github.com/xRedLeader/ai-ticketing-mcp/actions/runs/44223407288) verified application commit `b9486fad01fc6bfbf821d446a66bd21564042d63`: 110 unit/SQLite tests and 52 PostgreSQL integration tests passed, along with strict checking, formatting, credential scanning, production build, semantic commit validation, dependency audit, and the runtime image build. The audit found no vulnerabilities. PostgreSQL and Docker checks ran in GitHub Actions; they were not rerun locally.
+
+| Frozen reference measurement | Original baseline | This CI run |
+| ---------------------------- | ----------------: | ----------: |
+| Complete SDK protocol tokens |           141,387 |      77,896 |
+| Canonical model-view tokens  |           101,297 |      57,184 |
+| Worker input catalog         |             8,015 |       4,760 |
+| Tool calls / round trips     |                78 |          59 |
+
+The protocol reduction was 44.9058%. All six delivered-information checks and individual nonregression gates passed; the worker catalog remains below 5,000 reference tokens. The original baseline and scenario definitions were not changed. These figures are separate from the real-client usage above and from the historical load benchmark.
+
+Coverage now includes SQLite persistence and upgrades, execution-hint inheritance, exact-commit GitHub evidence and replay, durable signed webhook retries and crash recovery, and opt-in unblocking scheduling on both adapters. Notification tests used local receivers, including timeout, redirect refusal, stalled-receiver isolation, and accepted-before-ack retries. No external receiver was configured. Scheduling tests cover priority, the exact 24-hour aging boundary, deterministic ordering, eligibility, bounded queries, and concurrent claims; the historical 100,000-ticket load test was not rerun for this policy.
+
+The implementation was tracked in six durable `SELF` tickets through real MCP calls with separate worker and reviewer identities. A consistent SQLite backup preceded activation of the pinned application build and matching migrations. Comparing old columns after upgrade verified all 343 preexisting authoritative records unchanged, including historical receipts and evidence. The `SELF` project then opted into `unblocking` through MCP; existing active claims remained excluded from automatic selection. Local transcripts and the live database remain private.

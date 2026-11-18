@@ -16,8 +16,17 @@ import {
   type Knowledge,
   type SearchDocument,
   type Submission,
+  type ExecutionHints,
+  type GitHubConfiguration,
+  type GitHubProvider,
+  type GitHubEvidence,
+  type GitHubObservation,
+  type GitHubCIStatus,
+  type WebhookTarget,
+  type SchedulingPolicy,
+  validateGitHubConfiguration,
 } from './contracts.js';
-import { resultSchemas } from './result-schemas.js';
+import { resultSchemas, githubEvidenceSchema } from './result-schemas.js';
 import { serializeSuccessEnvelope } from './envelope.js';
 import { countReferenceTokens, queryExcerpt } from './tokens.js';
 import { CachedEmbeddings } from './query-embeddings.js';
@@ -25,12 +34,28 @@ import { CachedEmbeddings } from './query-embeddings.js';
 export interface ApplicationOptions {
   storage: StorageAdapter;
   search: SearchAdapter;
-  embeddings: EmbeddingProvider;
+  embeddings?: EmbeddingProvider;
   now?: () => Date;
   countReferenceTokens?: (text: string) => number;
   referenceTokenMetrics?: boolean;
+  github?: GitHubConfiguration & { provider: GitHubProvider };
+  webhook?: WebhookTarget;
 }
 const LEASE_MS = 600_000;
+const webhookEvents = new Set([
+  'ticket.created',
+  'ticket.updated',
+  'ticket.transitioned',
+  'ticket.invalidated',
+  'ticket.linked',
+  'ticket.checkpointed',
+  'ticket.note_added',
+  'ticket.submitted',
+  'ticket.reviewed',
+  'ticket.github_evidence_refreshed',
+  'work.claimed',
+  'work.released',
+]);
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 function canonical(value: unknown): string {
   if (Array.isArray(value)) return `[${value.map(canonical).join(',')}]`;
@@ -46,10 +71,12 @@ const digest = (value: unknown) => createHash('sha256').update(canonical(value))
 export class Application {
   readonly storage: StorageAdapter;
   readonly searchAdapter: SearchAdapter;
-  readonly embeddings: CachedEmbeddings;
+  readonly embeddings?: CachedEmbeddings;
   private now: () => Date;
   private countTokens: (text: string) => number;
   private referenceTokenMetrics: boolean;
+  private readonly github?: GitHubConfiguration & { provider: GitHubProvider };
+  private readonly webhook?: WebhookTarget;
   readonly metrics = {
     requests: 0,
     errors: 0,
@@ -64,13 +91,31 @@ export class Application {
   constructor(options: ApplicationOptions) {
     this.storage = options.storage;
     this.searchAdapter = options.search;
-    this.embeddings =
-      options.embeddings instanceof CachedEmbeddings
+    this.embeddings = options.embeddings
+      ? options.embeddings instanceof CachedEmbeddings
         ? options.embeddings
-        : new CachedEmbeddings(options.embeddings);
+        : new CachedEmbeddings(options.embeddings)
+      : undefined;
     this.now = options.now ?? (() => new Date());
     this.countTokens = options.countReferenceTokens ?? countReferenceTokens;
     this.referenceTokenMetrics = options.referenceTokenMetrics === true;
+    if (options.webhook) {
+      ensure(
+        options.storage.leaseDeliveries &&
+          options.storage.finishDelivery &&
+          /^[a-f0-9]{64}$/.test(options.webhook.fingerprint),
+        'INVALID_CONFIG',
+        'Webhook delivery requires durable delivery storage and a target fingerprint.',
+      );
+      this.webhook = options.webhook;
+    }
+    if (options.github) {
+      validateGitHubConfiguration(options.github);
+      this.github = Object.freeze({
+        ...options.github,
+        required_checks: Object.freeze([...options.github.required_checks]),
+      });
+    }
   }
   recordReferenceTokens(kind: 'request' | 'result', text: string) {
     if (!this.referenceTokenMetrics) return;
@@ -122,6 +167,8 @@ export class Application {
       'FORBIDDEN',
       'Project not found or access denied.',
     );
+    if (!project.execution_hints || !Object.keys(project.execution_hints).length)
+      delete project.execution_hints;
     return project;
   }
   private async ticket(reader: Reader, projectId: string, reference: string) {
@@ -129,7 +176,163 @@ export class Application {
       ? await reader.get('tickets', reference)
       : (await reader.find('tickets', { where: { project_id: projectId, key: reference }, limit: 1 }))[0];
     ensure(ticket && ticket.project_id === projectId, 'NOT_FOUND', 'Ticket not found in this project.');
+    if (ticket.github_pull_request === null) delete ticket.github_pull_request;
+    if (!ticket.execution_hints || !Object.keys(ticket.execution_hints).length) delete ticket.execution_hints;
     return ticket;
+  }
+  private executionHints(project: Project, ticket: Ticket): ExecutionHints | undefined {
+    const hints = { ...project.execution_hints, ...ticket.execution_hints };
+    return Object.keys(hints).length ? hints : undefined;
+  }
+  private schedulingPolicy(project: Pick<Project, 'scheduling_policy'>): SchedulingPolicy {
+    const policy = project.scheduling_policy ?? 'priority_age';
+    ensure(
+      policy === 'priority_age' ||
+        (policy === 'unblocking' && this.storage.schedulingPolicies?.includes(policy)),
+      'UNSUPPORTED_SCHEDULING_POLICY',
+      'Storage does not support this project scheduling policy.',
+    );
+    return policy;
+  }
+  private githubStatus(observation: GitHubObservation): GitHubCIStatus {
+    const configuration = this.github!;
+    if (observation.head_sha !== observation.observed_head_sha) return 'stale';
+    const checks = configuration.required_checks.map((name) =>
+      observation.checks.find(
+        (check) =>
+          check.name === name &&
+          check.required_app_id === configuration.check_app_id &&
+          check.app_id === configuration.check_app_id &&
+          check.head_sha === observation.head_sha &&
+          check.run_id,
+      ),
+    );
+    if (checks.some((check) => !check)) return 'missing';
+    if (checks.some((check) => check!.status !== 'completed')) return 'pending';
+    return checks.every((check) => check!.conclusion === 'success') ? 'passed' : 'failed';
+  }
+  private githubView(row: GitHubEvidence, ticket: Ticket, latestId = row.id) {
+    const configured = this.github;
+    const policyMatches =
+      configured &&
+      configured.repository.toLowerCase() === row.repository.toLowerCase() &&
+      configured.required_checks.length === row.checks.length &&
+      configured.required_checks.every((name) =>
+        row.checks.some((check) => check.name === name && check.required_app_id === configured.check_app_id),
+      );
+    return {
+      ...row,
+      stale:
+        !policyMatches ||
+        row.id !== latestId ||
+        row.status === 'stale' ||
+        row.head_sha !== row.observed_head_sha ||
+        row.requirements_revision !== ticket.requirements_revision ||
+        row.repository !== ticket.github_pull_request?.repository ||
+        row.pull_request_number !== ticket.github_pull_request?.number,
+    };
+  }
+  private async githubEvidence(reader: Reader, ticket: Ticket) {
+    if (!ticket.github_pull_request) return undefined;
+    const row = (
+      await reader.find('github_evidence', {
+        where: { project_id: ticket.project_id, ticket_id: ticket.id },
+        order: [
+          { field: 'ticket_revision', direction: 'desc' },
+          { field: 'id', direction: 'desc' },
+        ],
+        limit: 1,
+      })
+    )[0];
+    return row ? this.githubView(row, ticket) : undefined;
+  }
+  private async refreshGithub(actorId: string, input: Input<'ticket_github_refresh'>): Promise<unknown> {
+    const roles: Role[] = ['contributor', 'verifier', 'admin'];
+    const prepared = await this.storage.readSnapshot(async (reader) => {
+      const actor = await this.actor(actorId, reader);
+      await this.access(reader, actor, input.project_id, roles);
+      const receipt = await reader.get(
+        'receipts',
+        digest([actorId, input.project_id, 'ticket_github_refresh', input.idempotency_key]),
+      );
+      if (receipt) return { receipt: true as const };
+      ensure(
+        this.github,
+        'GITHUB_NOT_CONFIGURED',
+        'An operator must configure the trusted GitHub repository and required checks.',
+      );
+      const ticket = await this.ticket(reader, input.project_id, input.ticket_id);
+      const number = input.pull_request_number ?? ticket.github_pull_request?.number;
+      ensure(number, 'INVALID_INPUT', 'Provide pull_request_number when first linking a ticket.');
+      const binding = ticket.github_pull_request ?? null;
+      const changing = binding?.repository !== this.github.repository || binding?.number !== number;
+      if (changing) await this.access(reader, actor, input.project_id, ['contributor', 'admin']);
+      const latest = await this.githubEvidence(reader, ticket);
+      return {
+        receipt: false as const,
+        number,
+        binding,
+        requirements_revision: ticket.requirements_revision,
+        changing,
+        latest_evidence_id: latest?.id ?? null,
+      };
+    });
+    if (prepared.receipt)
+      return this.scoped(actorId, 'ticket_github_refresh', input, roles, async () => {
+        throw new DomainError(
+          'RECEIPT_UNAVAILABLE',
+          'This committed GitHub refresh receipt is unavailable. Do not reexecute it or replace its key.',
+          { committed: true },
+        );
+      });
+    const observation = await this.github!.provider.inspect(this.github!, prepared.number);
+    const status = this.githubStatus(observation);
+    const observedAt = this.timestamp();
+    return this.scoped(actorId, 'ticket_github_refresh', input, roles, async (tx, project, actor) => {
+      const ticket = await this.ticket(tx, project.id, input.ticket_id);
+      const latest = await this.githubEvidence(tx, ticket);
+      ensure(
+        ticket.requirements_revision === prepared.requirements_revision &&
+          digest(ticket.github_pull_request ?? null) === digest(prepared.binding) &&
+          (latest?.id ?? null) === prepared.latest_evidence_id,
+        'VERSION_CONFLICT',
+        'Ticket requirements, pull request binding, or evidence changed. Read current state before another refresh.',
+      );
+      if (prepared.changing) await this.access(tx, actor, project.id, ['contributor', 'admin']);
+      const row: GitHubEvidence = {
+        ...observation,
+        status,
+        id: randomUUID(),
+        project_id: project.id,
+        ticket_id: ticket.id,
+        actor_id: actor.id,
+        repository: this.github!.repository,
+        pull_request_number: prepared.number,
+        requirements_revision: ticket.requirements_revision,
+        ticket_revision: ticket.revision + 1,
+        observed_at: observedAt,
+      };
+      ticket.github_pull_request = { repository: row.repository, number: row.pull_request_number };
+      const verified = githubEvidenceSchema.safeParse(this.githubView(row, ticket));
+      ensure(verified.success, 'GITHUB_INVALID_RESPONSE', 'GitHub returned invalid evidence.');
+      const { stale, ...snapshot } = verified.data;
+      void stale;
+      await tx.put('github_evidence', snapshot);
+      await this.touch(tx, ticket);
+      await this.event(tx, project, actor, 'ticket.github_evidence_refreshed', ticket.id, {
+        evidence_id: row.id,
+        head_sha: row.head_sha,
+        status: row.status,
+      });
+      return {
+        ticket,
+        github_evidence: verified.data,
+        evidence_ref: {
+          tool: 'ticket_history',
+          arguments: { project_id: project.id, ticket_id: ticket.id, kind: 'github', item_id: row.id },
+        },
+      };
+    });
   }
   private version(record: { revision: number }, expected: number) {
     ensure(
@@ -149,16 +352,47 @@ export class Application {
   ) {
     project.event_seq++;
     await tx.put('projects', project);
+    const eventId = `${project.id}:${project.event_seq}`;
+    const occurredAt = this.timestamp();
     await tx.put('events', {
-      id: `${project.id}:${project.event_seq}`,
+      id: eventId,
       project_id: project.id,
       seq: project.event_seq,
       actor_id: actor.id,
       type,
       entity_id: entityId,
       data,
-      created_at: this.timestamp(),
+      created_at: occurredAt,
     });
+    if (this.webhook && webhookEvents.has(type)) {
+      const ticket = await this.ticket(tx, project.id, entityId);
+      const id = randomUUID();
+      await tx.put('outbound_deliveries', {
+        id,
+        event_id: eventId,
+        project_id: project.id,
+        body: JSON.stringify({
+          schema_version: 1,
+          delivery_id: id,
+          event_id: eventId,
+          project_id: project.id,
+          entity_id: entityId,
+          event_type: type,
+          seq: project.event_seq,
+          ticket_revision: ticket.revision,
+          requirements_revision: ticket.requirements_revision,
+          occurred_at: occurredAt,
+        }),
+        target_fingerprint: this.webhook.fingerprint,
+        attempt_count: 0,
+        next_attempt_at: occurredAt,
+        locked_until: null,
+        lock_token: null,
+        sent_at: null,
+        last_error: null,
+        created_at: occurredAt,
+      });
+    }
   }
   private async queue(
     tx: Transaction,
@@ -354,6 +588,7 @@ export class Application {
     actor: Actor,
     capabilities: string[],
     labels: string[],
+    at = this.timestamp(),
   ) {
     if (
       !['ready', 'in_progress'].includes(ticket.status) ||
@@ -366,31 +601,34 @@ export class Application {
     )
       return false;
     const claim = await reader.get('claims', ticket.id);
-    if (claim && claim.expires_at > this.timestamp()) return false;
+    if (claim && claim.expires_at > at) return false;
     return !(await this.blockers(reader, ticket)).length;
   }
   private async candidates(
     reader: Reader,
-    projectId: string,
+    project: Project,
     actor: Actor,
     capabilities: string[],
     labels: string[],
     limit: number,
   ) {
+    const policy = this.schedulingPolicy(project);
+    const at = this.timestamp();
     const result: Ticket[] = [];
     let offset = 0;
     while (result.length < limit) {
       const page = await reader.workCandidates(
-        projectId,
+        project.id,
         actor.id,
         capabilities,
         labels,
-        this.timestamp(),
+        at,
         limit,
         offset,
+        policy,
       );
       for (const ticket of page) {
-        if (await this.eligible(reader, ticket, actor, capabilities, labels)) result.push(ticket);
+        if (await this.eligible(reader, ticket, actor, capabilities, labels, at)) result.push(ticket);
         if (result.length === limit) break;
       }
       if (page.length < limit) break;
@@ -504,6 +742,7 @@ export class Application {
     }
   }
   private async dispatch(actorId: string, operation: Operation, input: any): Promise<unknown> {
+    if (operation === 'ticket_github_refresh') return this.refreshGithub(actorId, input);
     const roles: Role[] = ['contributor', 'admin'];
     if (['project_update', 'member_set'].includes(operation)) roles.splice(0, roles.length, 'admin');
     if (operation === 'ticket_review') roles.splice(0, roles.length, 'verifier', 'admin');
@@ -518,11 +757,14 @@ export class Application {
             name: data.name,
             instructions: data.instructions,
             policy: data.policy,
+            ...(data.scheduling_policy ? { scheduling_policy: data.scheduling_policy } : {}),
+            ...(data.execution_hints ? { execution_hints: data.execution_hints } : {}),
             revision: 1,
             ticket_seq: 0,
             event_seq: 0,
             created_at: this.timestamp(),
           };
+          this.schedulingPolicy(created);
           await tx.put('projects', created);
           await tx.put('members', {
             id: `${created.id}:${actor.id}`,
@@ -535,8 +777,22 @@ export class Application {
         }
         case 'project_update': {
           this.version(project, input.expected_revision);
+          this.schedulingPolicy({
+            scheduling_policy:
+              input.scheduling_policy === undefined
+                ? project.scheduling_policy
+                : (input.scheduling_policy ?? undefined),
+          });
           for (const key of ['name', 'instructions', 'policy'] as const)
             if (input[key] !== undefined) (project as any)[key] = input[key];
+          if (input.execution_hints !== undefined) {
+            if (input.execution_hints) project.execution_hints = input.execution_hints;
+            else delete project.execution_hints;
+          }
+          if (input.scheduling_policy !== undefined) {
+            if (input.scheduling_policy) project.scheduling_policy = input.scheduling_policy;
+            else delete project.scheduling_policy;
+          }
           project.revision++;
           await this.event(tx, project, actor, 'project.updated', project.id, { revision: project.revision });
           return project;
@@ -568,6 +824,7 @@ export class Application {
               key: `${project.key}-${++project.ticket_seq}`,
               title: item.title,
               description: item.description,
+              ...(item.execution_hints ? { execution_hints: item.execution_hints } : {}),
               status: item.status,
               priority: item.priority,
               labels: item.labels,
@@ -631,7 +888,7 @@ export class Application {
         case 'work_claim': {
           const ticket = input.ticket_id
             ? await this.ticket(tx, project.id, input.ticket_id)
-            : (await this.candidates(tx, project.id, actor, input.capabilities, input.labels, 1))[0];
+            : (await this.candidates(tx, project, actor, input.capabilities, input.labels, 1))[0];
           ensure(ticket, 'NO_ELIGIBLE_WORK', 'No eligible work is currently available.');
           if (input.ticket_id) {
             const blockers = await this.blockers(tx, ticket);
@@ -727,6 +984,10 @@ export class Application {
     switch (operation) {
       case 'ticket_update': {
         this.version(ticket, input.expected_revision);
+        if (input.execution_hints !== undefined) {
+          if (input.execution_hints) ticket.execution_hints = input.execution_hints;
+          else delete ticket.execution_hints;
+        }
         if (input.assignee_id)
           await this.access(tx, await this.actor(input.assignee_id, tx), project.id, [
             'contributor',
@@ -963,12 +1224,13 @@ export class Application {
   }
   private async details(
     reader: Reader,
-    projectId: string,
+    project: Project,
     ticket: Ticket,
     actor: Actor,
     at = this.timestamp(),
   ) {
-    const [criteria, links, claim, blockers] = await Promise.all([
+    const projectId = project.id;
+    const [criteria, links, claim, blockers, githubEvidence] = await Promise.all([
       reader.find('criteria', {
         where: { project_id: projectId, ticket_id: ticket.id },
         order: [{ field: 'position', direction: 'asc' }],
@@ -976,9 +1238,13 @@ export class Application {
       reader.find('links', { where: { project_id: projectId, target_id: ticket.id }, limit: 10001 }),
       reader.get('claims', ticket.id),
       this.blockers(reader, ticket),
+      this.githubEvidence(reader, ticket),
     ]);
+    const executionHints = this.executionHints(project, ticket);
     return {
       ticket,
+      ...(executionHints ? { effective_execution_hints: executionHints } : {}),
+      ...(githubEvidence ? { github_evidence: githubEvidence } : {}),
       criteria,
       links,
       claim: claim
@@ -1059,13 +1325,30 @@ export class Application {
       case 'ticket_get':
         return this.details(
           this.storage,
-          project.id,
+          project,
           await this.ticket(this.storage, project.id, input.ticket_id),
           actor,
         );
       case 'ticket_history': {
         const ticket = await this.ticket(this.storage, project.id, input.ticket_id);
-        if (input.unanswered_questions)
+        if (input.kind === 'github') {
+          const latest = await this.githubEvidence(this.storage, ticket);
+          const items = await this.storage.find('github_evidence', {
+            where: {
+              project_id: project.id,
+              ticket_id: ticket.id,
+              ...(input.item_id ? { id: input.item_id } : {}),
+            },
+            order: [
+              { field: 'ticket_revision', direction: 'desc' },
+              { field: 'id', direction: 'desc' },
+            ],
+            limit: input.limit,
+            offset: input.offset,
+          });
+          return { items: items.map((row) => this.githubView(row, ticket, latest?.id)) };
+        }
+        if (input.nonblocking_unanswered)
           return {
             items: await this.storage.unansweredQuestions(
               project.id,
@@ -1097,7 +1380,7 @@ export class Application {
           return {
             tickets: await this.candidates(
               this.storage,
-              project.id,
+              project,
               actor,
               input.capabilities,
               input.labels,
@@ -1230,14 +1513,14 @@ export class Application {
   private async search(actor: Actor, input: Input<'search'>) {
     let degraded: string | null = null;
     let semantic;
-    try {
-      semantic = {
-        profile: this.embeddings.profile,
-        vector: await this.embeddings.embed(input.query, 'query'),
-      };
-    } catch {
-      degraded = 'Embedding provider unavailable; returning full-text results.';
-    }
+    const embeddings = this.searchAdapter.capabilities?.semantic === false ? undefined : this.embeddings;
+    if (embeddings) {
+      try {
+        semantic = { profile: embeddings.profile, vector: await embeddings.embed(input.query, 'query') };
+      } catch {
+        degraded = 'Embedding provider unavailable; returning full-text results.';
+      }
+    } else degraded = 'Semantic search is disabled; returning full-text results.';
     const hits = await this.searchAdapter.search(
       input.project_id,
       input.query,
@@ -1294,7 +1577,7 @@ export class Application {
     }
     // Recheck grants after provider/network calls so a revoked identity cannot receive cached candidates.
     await this.access(this.storage, actor, input.project_id);
-    const coverage = await this.searchAdapter.coverage(input.project_id, this.embeddings.profile);
+    const coverage = await this.searchAdapter.coverage(input.project_id, embeddings?.profile);
     if (!degraded && coverage.embedded < coverage.documents)
       degraded = 'Semantic indexing is incomplete; full-text results remain available.';
     return { results, degraded, coverage, index_consistency: 'eventual' };
@@ -1316,7 +1599,7 @@ export class Application {
   ) {
     const at = this.timestamp();
     const ticket = await this.ticket(reader, project.id, input.ticket_id);
-    const detail = await this.details(reader, project.id, ticket, actor, at);
+    const detail = await this.details(reader, project, ticket, actor, at);
     ensure(
       detail.links.length <= 10000,
       'GRAPH_LIMIT',
@@ -1425,6 +1708,7 @@ export class Application {
       blockers: detail.blockers,
       completionBlockers,
       claim: detail.claim,
+      github_evidence: detail.github_evidence,
       checkpoint,
       questions,
       reviews,
@@ -1437,6 +1721,9 @@ export class Application {
       fingerprint,
       not_modified: false,
       ticket,
+      ...(detail.effective_execution_hints
+        ? { effective_execution_hints: detail.effective_execution_hints }
+        : {}),
       criteria: detail.criteria,
       project_instructions: { text: project.instructions, authority: 'project_administrator' },
       approval_policy: project.policy,
@@ -1480,7 +1767,7 @@ export class Application {
         omission: {
           section: 'open_questions',
           retrieve_with: 'ticket_history',
-          arguments: { ...history('notes'), unanswered_questions: true, offset: 0 },
+          arguments: { ...history('notes'), nonblocking_unanswered: true, offset: 0 },
         },
       },
       {
@@ -1508,6 +1795,19 @@ export class Application {
         },
       },
     ];
+    if (detail.github_evidence)
+      sections.push({
+        name: 'github_evidence',
+        value: detail.github_evidence,
+        empty: false,
+        omission: {
+          section: 'github_evidence',
+          retrieve_with: 'ticket_history',
+          arguments: { ...history('github', detail.github_evidence.id) },
+          revision: detail.github_evidence.requirements_revision,
+          required_before: 'review',
+        },
+      });
     const overflow: Omission[] = [];
     for (const [name, items] of [
       ['reviews', reviews],
@@ -1557,7 +1857,7 @@ export class Application {
         addedNotice = {
           section: 'open_questions_more',
           retrieve_with: 'ticket_history',
-          arguments: { ...history('notes'), unanswered_questions: true, offset: 0 },
+          arguments: { ...history('notes'), nonblocking_unanswered: true, offset: 0 },
         };
       const delta =
         cost - this.responseTokens(section.omission) + (addedNotice ? this.responseTokens(addedNotice) : 0);
@@ -1630,6 +1930,38 @@ export class Application {
     return best;
   }
 
+  async deliverOnce(limit = 1) {
+    if (!this.webhook) return 0;
+    ensure(
+      Number.isInteger(limit) && limit >= 1 && limit <= 100,
+      'INVALID_INPUT',
+      'Delivery batch must be 1–100.',
+    );
+    const deliveries = await this.storage.leaseDeliveries!(
+      this.webhook.fingerprint,
+      limit,
+      limit * 5000 + 10000,
+    );
+    for (const delivery of deliveries) {
+      let errorCode: string | undefined;
+      try {
+        errorCode = (await this.webhook.send(delivery))?.error_code;
+      } catch {
+        errorCode = 'NETWORK_ERROR';
+      }
+      if (errorCode) {
+        const safeCode = /^[A-Z][A-Z0-9_]{0,79}$/.test(errorCode) ? errorCode : 'DELIVERY_FAILED';
+        const backoffMs = Math.min(3600000, 1000 * 2 ** Math.min(delivery.attempt_count, 12));
+        await this.storage.finishDelivery!(delivery, {
+          next_attempt_at: new Date(this.now().getTime() + backoffMs).toISOString(),
+          error_code: safeCode,
+        });
+      } else {
+        await this.storage.finishDelivery!(delivery, { sent_at: this.timestamp() });
+      }
+    }
+    return deliveries.length;
+  }
   async indexOnce(limit = 10) {
     const jobs = await this.storage.leaseJobs(limit, 300_000);
     for (const job of jobs) {
@@ -1637,7 +1969,7 @@ export class Application {
         const document = await this.sourceDocument(this.storage, job.kind, job.entity_id);
         if (document) {
           await this.searchAdapter.indexText(document);
-          if (!document.archived) {
+          if (!document.archived && this.embeddings && this.searchAdapter.capabilities?.semantic !== false) {
             const text = `${document.title}\n${document.text}`;
             const inputHash = createHash('sha256').update(text).digest('hex');
             if (await this.searchAdapter.reuseVector?.(document, this.embeddings.profile, inputHash)) {
